@@ -11,6 +11,11 @@ config.macos_window_background_blur = 20
 -- For example, changing the color scheme:
 config.enable_scroll_bar = true
 config.hide_tab_bar_if_only_one_tab = true
+config.colors  = {
+  foreground = '#ffffff'
+  background = '#1a1b26'
+}
+
 
 -- and finally, return the configuration to wezterm
 return config
