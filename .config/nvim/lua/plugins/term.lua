@@ -2,6 +2,7 @@ return {
   "akinsho/toggleterm.nvim",
   config = function()
     require("toggleterm").setup({
+      size = vim.o.lines / 3,
       open_mapping = [[<c-\>]],
       shade_terminals = true,
       title_pos = "center",
