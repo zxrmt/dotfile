@@ -14,7 +14,7 @@ return {
         enabled = true,
         name_formatter = function(term) --  term: Terminal
           return string.rep("-", vim.o.columns * 4)
-        end
+        end,
       },
     })
   end,
