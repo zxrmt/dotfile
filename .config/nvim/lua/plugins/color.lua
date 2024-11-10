@@ -1,4 +1,4 @@
---[[return {
+return {
   "folke/tokyonight.nvim",
   opts = {
     transparent = true,
@@ -12,8 +12,8 @@
     vim.cmd("colorscheme tokyonight-moon")
   end,
 }
-]]
---
+
+--[=====[ 
 
 return {
   "roobert/palette.nvim",
@@ -64,7 +64,8 @@ return {
       },
       transparent_background = true,
     })
-
     vim.cmd([[colorscheme palette]])
   end,
 }
+
+--]=====]
