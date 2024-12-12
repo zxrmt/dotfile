@@ -1,0 +1,4 @@
+set bind-tty-special-chars Off
+TAB: complete-filename
+M-/: complete
+set colored-stats on
