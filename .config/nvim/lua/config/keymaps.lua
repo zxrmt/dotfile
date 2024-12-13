@@ -6,3 +6,6 @@ vim.api.nvim_set_keymap("n", "q", "<Nop>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "m", ":w<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "<C-m>", ":w<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", ";", ":", { noremap = true, silent = true })
+-- Hex editing stuff
+vim.api.nvim_set_keymap('n', '<leader>he', ':%!xxd<CR>', { noremap = true, silent = true })
+vim.api.nvim_set_keymap('n', '<leader>hu', ':%!xxd -r<CR>', { noremap = true, silent = true })
