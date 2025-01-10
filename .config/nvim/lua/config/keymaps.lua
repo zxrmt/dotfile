@@ -6,9 +6,10 @@ vim.api.nvim_set_keymap("n", "q", "<Nop>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "m", ":w<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "<C-m>", ":w<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", ";", ":", { noremap = true, silent = true })
+vim.api.nvim_set_keymap("n", "f", ":Telescope grep_string", { noremap = true, silent = true })
+
+
+vim.api.nvim_set_keymap("n", "q", ":q!<CR>", { noremap = true, silent = true })
 -- Hex editing stuff
 vim.api.nvim_set_keymap('n', '<leader>he', ':%!xxd<CR>', { noremap = true, silent = true })
 vim.api.nvim_set_keymap('n', '<leader>hu', ':%!xxd -r<CR>', { noremap = true, silent = true })
-
--- Map f to find string under cursor
-vim.api.nvim_set_keymap("n", "f", ":Telescope grep_string<CR>", { noremap = true, silent = true })
