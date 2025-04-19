@@ -4,7 +4,7 @@ if [[ $- == *i* ]]; then
 fi
 export PROMPT_COMMAND='history -a'
 
-export PS1='\[\033[01;34m\][\h]\[\033[01;32m\]$(pwd) \[\033[0m\]# '
+export PS1='[\t] \[\033[01;34m\][\h]\[\033[01;32m\]$(pwd) \[\033[0m\]# '
 
 alias ls='ls --color=auto'
 alias ll='ls -lah'
