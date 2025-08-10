@@ -22,3 +22,20 @@ map("i", "=", "=<C-g>u", {})
 map("i", '"', '"<C-g>u', {})
 map("i", "<space>", "<space><C-g>u", {})
 map("i", "<CR>", "<CR><C-g>u", {})
+
+
+vim.o.autoread = true
+
+-- Trigger autoread when switching buffers, gaining focus, or reading from file
+vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold", "CursorHoldI" }, {
+  command = "checktime",
+})
+
+-- Notify if file changed
+vim.api.nvim_create_autocmd("FileChangedShellPost", {
+  callback = function()
+    vim.notify("File changed on disk. Buffer reloaded!", vim.log.levels.WARN)
+  end,
+})
+
+
