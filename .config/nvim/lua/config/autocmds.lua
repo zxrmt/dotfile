@@ -38,4 +38,16 @@ vim.api.nvim_create_autocmd("FileChangedShellPost", {
   end,
 })
 
+-- Disable diagnostics after LazyVim loads
+vim.api.nvim_create_autocmd("VimEnter", {
+  callback = function()
+    vim.diagnostic.config({
+      virtual_text = false,
+      signs = false,
+      underline = false,
+      update_in_insert = false,
+    })
+  end,
+})
+
 
