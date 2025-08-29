@@ -23,7 +23,6 @@ map("i", '"', '"<C-g>u', {})
 map("i", "<space>", "<space><C-g>u", {})
 map("i", "<CR>", "<CR><C-g>u", {})
 
-
 vim.o.autoread = true
 
 -- Trigger autoread when switching buffers, gaining focus, or reading from file
@@ -38,6 +37,23 @@ vim.api.nvim_create_autocmd("FileChangedShellPost", {
   end,
 })
 
+-- Autoformat setting
+local set_autoformat = function(pattern, bool_val)
+  vim.api.nvim_create_autocmd({ "FileType" }, {
+    pattern = pattern,
+    callback = function()
+      vim.b.autoformat = bool_val
+    end,
+  })
+end
+
+set_autoformat({ "python" }, false)
+set_autoformat({ "py" }, false)
+set_autoformat({ "fish" }, false)
+set_autoformat({ "lua" }, false)
+set_autoformat({ "perl" }, false)
+set_autoformat({ "yaml" }, false)
+
 -- Disable diagnostics after LazyVim loads
 vim.api.nvim_create_autocmd("VimEnter", {
   callback = function()
@@ -49,5 +65,3 @@ vim.api.nvim_create_autocmd("VimEnter", {
     })
   end,
 })
-
-
