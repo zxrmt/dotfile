@@ -15,7 +15,7 @@ alias h="history | cut -c 8- | grep -E -v '^ *[0-9]+ *h ' | grep "
 #eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 
 # Copy file to clipboard
-bat() {
+z() {
         printf "\033]52;c;%s\a" "$(base64 < $1 | tr -d '\n')"
 }
 
