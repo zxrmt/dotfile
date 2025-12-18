@@ -6,8 +6,7 @@ return {
         border = "rounded",
       },
       ensure_installed = {
-        "pyright",
-        "ruff",
+        "pyright"
       },
     },
   },
