@@ -23,4 +23,3 @@ tmux() {
   command tmux -u "$@"
 }
 
-export PATH="$HOME/.local/bin:$PATH"
