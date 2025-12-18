@@ -28,3 +28,5 @@ vim.keymap.set("n", "<C-i>", "<C-i>", { noremap = true, silent = true, desc = "G
 vim.keymap.set("n", "<C-t>", ":w<CR>", { desc = "Save file" })
 vim.keymap.set("i", "<C-t>", "<Esc>:w<CR>a", { desc = "Save file" })
 
+-- Map Shift + U to the redo function in Normal mode
+vim.api.nvim_set_keymap('n', '<S-U>', '<C-r>', { noremap = true, silent = true })
