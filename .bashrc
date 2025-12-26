@@ -23,3 +23,17 @@ tmux() {
   command tmux -u "$@"
 }
 
+
+bind -r "\C-l"
+export FZF_DEFAULT_OPTS='--bind ctrl-i:half-page-down,ctrl-e:half-page-up,ctrl-u:preview-half-page-up,ctrl-d:preview-half-page-down' 
+
+f() {
+  fzf --preview 'bat --style=numbers --color=always {}' 
+}
+
+fp() {
+  git diff --name-only "$@" |
+    fzf --ansi \
+        --preview 'git diff --color=always -- {}' 
+}
+
