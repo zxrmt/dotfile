@@ -31,9 +31,25 @@ f() {
   fzf --preview 'batcat --style=numbers --color=always {}' 
 }
 
+# Using fp to see current change, fp <commit_id> to see the commit change
 fp() {
-  git diff --name-only "$@" |
-    fzf --ansi \
-        --preview 'git diff --color=always -- {}' 
+  if [ $# -eq 0 ]; then
+    # Unstaged changes
+    git diff --name-only |
+      fzf --ansi \
+          --preview 'git diff --color=always -- {}'
+  elif [ $# -eq 1 ]; then
+    # One commit only
+    local commit="$1"
+    git show --pretty="" --name-only "$commit" |
+      fzf --ansi \
+          --preview "git show --color=always '$commit' -- {}"
+  else
+    echo "usage: fp [commit-ish]" >&2
+    return 2
+  fi
 }
+
+
+
 
