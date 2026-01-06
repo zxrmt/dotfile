@@ -31,8 +31,8 @@ f() {
   fzf --preview 'batcat --style=numbers --color=always {}' 
 }
 
-# Using fp to see current change, fp <commit_id> to see the commit change
-fp() {
+# Using g to see current change, g <commit_id> to see the commit change
+g() {
   if [ $# -eq 0 ]; then
     # Unstaged changes
     git diff --name-only |
