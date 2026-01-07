@@ -11,6 +11,8 @@ vim.api.nvim_set_keymap("n", "f", ":Telescope grep_string", { noremap = true, si
 
 vim.api.nvim_set_keymap("n", "q", ":q!<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "Q", ":qa!<CR>", { noremap = true, silent = true })
+-- Replace all \n to \n
+vim.api.nvim_set_keymap("n", "<leader>rn", [[:%s/\\n/\r/g<CR>]], { noremap = true, silent = true })
 
 -- Hex editing stuff
 vim.api.nvim_set_keymap("n", "<leader>he", ":%!xxd<CR>", { noremap = true, silent = true })
