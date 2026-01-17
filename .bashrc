@@ -50,6 +50,12 @@ g() {
   fi
 }
 
+# Using this to sync the ZAI_API_KEY between tmux panel
+
+# __tmux_sync_myvar() {
+#  [[ -n "$TMUX" ]] && tmux set -p -t "$TMUX_PANE" @ZAI_API_KEY "$ZAI_API_KEY" 2>/dev/null
+# }
+# PROMPT_COMMAND="__tmux_sync_myvar${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 
 
