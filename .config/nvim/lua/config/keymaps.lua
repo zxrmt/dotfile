@@ -9,7 +9,9 @@ vim.api.nvim_set_keymap("n", "<C-m>", ":w<CR>", { noremap = true, silent = true 
 vim.api.nvim_set_keymap("n", ";", ":", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "f", ":Telescope grep_string", { noremap = true, silent = true })
 
-vim.api.nvim_set_keymap("n", "q", ":q!<CR>", { noremap = true, silent = true })
+-- Delete current buffer but let other open, jump back to prev buffer
+vim.api.nvim_set_keymap("n", "q", ":bp | bd #<CR>", { noremap = true, silent = true })
+
 vim.api.nvim_set_keymap("n", "Q", ":qa!<CR>", { noremap = true, silent = true })
 -- Replace all \n to \n
 vim.api.nvim_set_keymap("n", "<leader>rn", [[:%s/\\n/\r/g<CR>]], { noremap = true, silent = true })
