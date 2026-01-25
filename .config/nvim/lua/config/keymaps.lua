@@ -37,3 +37,14 @@ vim.keymap.set("i", "<C-t>", "<Esc>:w<CR>a", { desc = "Save file" })
 
 -- Map Shift + U to the redo function in Normal mode
 vim.api.nvim_set_keymap('n', '<S-U>', '<C-r>', { noremap = true, silent = true })
+
+
+-- Ctrl+Left / Ctrl+Right = word motions (b / w)
+vim.keymap.set({ "n", "v", "o" }, "<C-Left>", "b", { desc = "Back one word" })
+vim.keymap.set({ "n", "v", "o" }, "<C-Right>", "w", { desc = "Forward one word" })
+
+-- Insert mode: word motions without leaving insert
+vim.keymap.set("i", "<C-Left>",  "<C-o>b", { desc = "Back one word (insert)" })
+vim.keymap.set("i", "<C-Right>", "<C-o>w", { desc = "Forward one word (insert)" })
+
+
