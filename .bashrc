@@ -4,7 +4,17 @@ if [[ $- == *i* ]]; then
 fi
 export PROMPT_COMMAND='history -a'
 
-export PS1='[\t] \[\033[01;34m\][\h]\[\033[01;32m\]$(pwd) \[\033[0m\]# '
+git_prompt_info() {
+  git rev-parse --is-inside-work-tree &>/dev/null || return
+
+  local branch commit
+  branch=$(git symbolic-ref --short HEAD 2>/dev/null || git describe --tags --exact-match 2>/dev/null)
+  commit=$(git rev-parse --short HEAD 2>/dev/null)
+
+  echo " (${branch}@${commit})"
+}
+
+export PS1='[\t] \[\033[01;34m\][\h]\[\033[01;32m\]\w\[\033[33m\]$(git_prompt_info)\[\033[0m\]# '
 
 alias ls='ls --color=auto'
 alias ll='ls -lah'
