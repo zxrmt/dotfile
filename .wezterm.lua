@@ -1,7 +1,44 @@
 local wezterm = require 'wezterm'
+local act = wezterm.action
 
 -- This will hold the configuration.
 local config = wezterm.config_builder()
+
+
+wezterm.on('user-var-changed', function(window, pane, name, value)
+  wezterm.log_info('var', name, value)
+  if name == 'wez_not' then
+    window:toast_notification('wezterm', 'msg: ' .. value, nil, 1000)
+  end
+
+end)
+
+
+config.term = "xterm-256color"
+
+
+
+
+
+wezterm.on('bell', function(window, pane)
+  -- Ignore bells from the currently focused pane
+  local active = window:active_pane()
+  if active and pane:pane_id() == active:pane_id() then
+    return
+  end
+
+  local tab = pane:tab()
+  local tab_title = tab and tab:get_title() or 'other tab'
+  window:toast_notification('Notification', 'Task completed: ' .. tab_title, nil, 9000)
+end)
+
+
+
+
+
+
+
+
 
 
 
@@ -12,7 +49,7 @@ config.scrollback_lines = 10000
 config.enable_scroll_bar = true
 config.hide_tab_bar_if_only_one_tab = true
 
-config.max_fps = 200
+config.max_fps = 120
 config.front_end = "WebGpu"
 
 config.audible_bell = "Disabled"
@@ -35,7 +72,6 @@ config.window_frame = {
 }
 config.window_background_opacity = 0.95
 config.macos_window_background_blur = 50
--- cmd + a to copy to clipboard
 config.keys = {
 { key = 'a', mods = 'CMD', action = wezterm.action_callback(function(window, pane)
     local dims = pane:get_dimensions()
@@ -46,6 +82,17 @@ config.keys = {
 
 }
 
+
+function tab_title(tab_info)
+  local title = tab_info.tab_title
+  -- if the tab title is explicitly set, take that
+  if title and #title > 0 then
+    return title
+  end
+  -- Otherwise, use the title from the active pane
+  -- in that tab
+  return tab_info.active_pane.title
+end
 
 
 -- and finally, return the configuration to wezterm
