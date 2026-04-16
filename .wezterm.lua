@@ -16,8 +16,16 @@ end)
 
 config.term = "xterm-256color"
 
-
-
+-- blur the wezterm active window
+wezterm.on('window-focus-changed', function(window, pane)
+  local overrides = window:get_config_overrides() or {}
+  if window:is_focused() then
+    overrides.window_background_opacity = 0.8
+  else
+    overrides.window_background_opacity = 1.0
+  end
+  window:set_config_overrides(overrides)
+end)
 
 
 wezterm.on('bell', function(window, pane)
@@ -31,15 +39,6 @@ wezterm.on('bell', function(window, pane)
   local tab_title = tab and tab:get_title() or 'other tab'
   window:toast_notification('Notification', 'Task completed: ' .. tab_title, nil, 9000)
 end)
-
-
-
-
-
-
-
-
-
 
 
 -- This is where you actually apply your config choices
