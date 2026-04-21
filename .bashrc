@@ -66,6 +66,10 @@ g() {
 #  [[ -n "$TMUX" ]] && tmux set -p -t "$TMUX_PANE" @ZAI_API_KEY "$ZAI_API_KEY" 2>/dev/null
 # }
 # PROMPT_COMMAND="__tmux_sync_myvar${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+# Alway full permission
+alias yolo="claude --dangerously-skip-permissions"
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+export ENABLE_CLAUDEAI_MCP_SERVERS=false
 
 
 
