@@ -8,7 +8,7 @@ RUN apt update -y && \
     apt install -y nodejs
 
 RUN apt update -y
-RUN apt install -y git gzip unzip make cmake ripgrep fzf tmux python3-venv bat lazygit build-essential 
+RUN apt install -y git gzip unzip make cmake ripgrep fzf tmux python3-venv bat lazygit build-essential curl wget xxd file
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 100
 
 RUN curl -L https://foundry.paradigm.xyz | bash
