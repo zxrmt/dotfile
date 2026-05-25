@@ -41,6 +41,14 @@ WORKDIR neovim
 RUN make CMAKE_BUILD_TYPE=RelWithDebInfo
 
 
+# Replace unstable Rust coreutils with GNU coreutils
+RUN apt-get update && \
+    apt-get remove -y --allow-remove-essential rust-coreutils coreutils-from-uutils && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+
 USER root
 RUN make install
 USER zx
