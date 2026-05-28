@@ -4,6 +4,43 @@ local act = wezterm.action
 -- This will hold the configuration.
 local config = wezterm.config_builder()
 
+--  Create border on focus window ---
+local focused_border = '#7aa2f7'
+local unfocused_border = '#2a2a2a'
+
+local function window_frame_with_border(color)
+  return {
+    border_left_width = '0.15cell',
+    border_right_width = '0.15cell',
+    border_top_height = '0.15cell',
+    border_bottom_height = '0.15cell',
+
+    border_left_color = color,
+    border_right_color = color,
+    border_top_color = color,
+    border_bottom_color = color,
+  }
+end
+
+-- Keep resize border; use "TITLE | RESIZE" if you want the normal titlebar too.
+config.window_decorations = 'RESIZE'
+
+-- Default state.
+config.window_frame = window_frame_with_border(unfocused_border)
+
+wezterm.on('window-focus-changed', function(window, pane)
+  local overrides = window:get_config_overrides() or {}
+
+  if window:is_focused() then
+    overrides.window_frame = window_frame_with_border(focused_border)
+  else
+    overrides.window_frame = window_frame_with_border(unfocused_border)
+  end
+
+  window:set_config_overrides(overrides)
+end)
+
+
 
 
 -- Needed so update-status clears alerts soon after you switch tabs.
