@@ -5,6 +5,94 @@ local act = wezterm.action
 local config = wezterm.config_builder()
 
 
+
+-- Needed so update-status clears alerts soon after you switch tabs.
+config.status_update_interval = 250
+
+local ALERT_BG = '#ff5f57'
+local ALERT_FG = '#ffffff'
+
+-- tab_id -> true
+local bell_alert_tabs = {}
+
+-- window_id -> true/false
+local focused_windows = {}
+
+local function tab_title(tab)
+  if tab.tab_title and #tab.tab_title > 0 then
+    return tab.tab_title
+  end
+  return tab.active_pane.title
+end
+
+local function request_redraw(window)
+  -- Nudges WezTerm to recompute the tab bar.
+  window:set_config_overrides(window:get_config_overrides() or {})
+end
+
+local function clear_active_alert(window)
+  focused_windows[window:window_id()] = window:is_focused()
+
+  if not window:is_focused() then
+    return
+  end
+
+  local tab = window:active_tab()
+  if tab then
+    bell_alert_tabs[tab:tab_id()] = nil
+    request_redraw(window)
+  end
+end
+
+wezterm.on('bell', function(window, pane)
+  local tab = pane:tab()
+  if not tab then
+    return
+  end
+
+  local tab_id = tab:tab_id()
+  local active = window:active_tab()
+
+  -- If the bell rings in the tab you're already looking at, don't latch it.
+  if window:is_focused() and active and active:tab_id() == tab_id then
+    bell_alert_tabs[tab_id] = nil
+  else
+    bell_alert_tabs[tab_id] = true
+  end
+
+  request_redraw(window)
+end)
+
+wezterm.on('window-focus-changed', function(window, pane)
+  clear_active_alert(window)
+end)
+
+wezterm.on('update-status', function(window, pane)
+  clear_active_alert(window)
+end)
+
+wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
+  local title = tab_title(tab)
+  title = wezterm.truncate_right(title, math.max(1, max_width - 4))
+
+  -- Also clear during render if this alert tab is now active and focused.
+  if tab.is_active and focused_windows[tab.window_id] then
+    bell_alert_tabs[tab.tab_id] = nil
+  end
+
+  if bell_alert_tabs[tab.tab_id] then
+    return {
+      { Background = { Color = ALERT_BG } },
+      { Foreground = { Color = ALERT_FG } },
+      { Attribute = { Intensity = 'Bold' } },
+      { Text = ' 🔔 ' .. title .. ' ' },
+    }
+  end
+
+  return ' ' .. title .. ' '
+end)
+
+
 wezterm.on('user-var-changed', function(window, pane, name, value)
   wezterm.log_info('var', name, value)
   if name == 'wez_not' then
