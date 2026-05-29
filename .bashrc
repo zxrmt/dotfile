@@ -71,5 +71,7 @@ alias yolo="claude --dangerously-skip-permissions"
 export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 export ENABLE_CLAUDEAI_MCP_SERVERS=false
 
+export PATH="$HOME/.local/bin:$PATH"
+
 
 
