@@ -4,7 +4,11 @@ local act = wezterm.action
 -- This will hold the configuration.
 local config = wezterm.config_builder()
 
---  Create border on focus window ---
+
+-- config.use_fancy_tab_bar = false
+config.tab_max_width = 200
+
+
 local focused_border = '#7aa2f7'
 local unfocused_border = '#2a2a2a'
 
@@ -108,27 +112,43 @@ wezterm.on('update-status', function(window, pane)
   clear_active_alert(window)
 end)
 
-wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
-  local title = tab_title(tab)
-  title = wezterm.truncate_right(title, math.max(1, max_width - 4))
+local FIXED_TAB_WIDTH = 20
 
-  -- Also clear during render if this alert tab is now active and focused.
-  if tab.is_active and focused_windows[tab.window_id] then
-    bell_alert_tabs[tab.tab_id] = nil
+local function pad_right(s, width)
+  local pad = width - wezterm.column_width(s)
+  if pad > 0 then
+    return s .. string.rep(' ', pad)
   end
+  return s
+end
+
+wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
+  local width = math.min(FIXED_TAB_WIDTH, max_width)
+
+  local title = tab_title(tab)
+
+  local prefix = ' '
+  local suffix = ' '
+
+  if bell_alert_tabs[tab.tab_id] then
+    prefix = ' 🔔 '
+  end
+
+  local title_width = math.max(1, width - wezterm.column_width(prefix) - wezterm.column_width(suffix))
+  title = wezterm.truncate_right(title, title_width)
+  title = pad_right(title, title_width)
 
   if bell_alert_tabs[tab.tab_id] then
     return {
       { Background = { Color = ALERT_BG } },
       { Foreground = { Color = ALERT_FG } },
       { Attribute = { Intensity = 'Bold' } },
-      { Text = ' 🔔 ' .. title .. ' ' },
+      { Text = prefix .. title .. suffix },
     }
   end
 
-  return ' ' .. title .. ' '
+  return prefix .. title .. suffix
 end)
-
 
 wezterm.on('user-var-changed', function(window, pane, name, value)
   wezterm.log_info('var', name, value)
