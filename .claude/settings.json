@@ -2,7 +2,8 @@
   "env": {
     "CLAUDE_CODE_DISABLE_MOUSE": "1",
     "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "20"
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "20",
+    "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"
   },
   "model": "claude-opus-4-8[1m]",
   "effortLevel": "xhigh",
