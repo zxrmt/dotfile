@@ -1,9 +1,15 @@
 {
   "env": {
     "CLAUDE_CODE_DISABLE_MOUSE": "1",
-    "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1"
+    "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "20"
   },
+  "model": "claude-opus-4-8[1m]",
+  "effortLevel": "xhigh",
+  "prefersReducedMotion": true,
+  "spinnerTipsEnabled": false,
   "skipDangerousModePermissionPrompt": true,
   "theme": "dark",
-  "preferredNotifChannel": "terminal_bell"
+  "preferredNotifChannel": "terminal_bell",
+  "agentPushNotifEnabled": true
 }
