@@ -214,6 +214,8 @@ config.window_frame = {
         inactive_titlebar_bg = "#1a1b26",
         active_titlebar_bg = "#1a1b26",
 }
+
+
 config.window_background_opacity = 0.95
 config.macos_window_background_blur = 50
 config.keys = {
@@ -222,9 +224,12 @@ config.keys = {
     local txt = pane:get_text_from_region(0, dims.scrollback_top, 0, dims.scrollback_top + dims.scrollback_rows)
     window:copy_to_clipboard(txt:match('^%s*(.-)%s*$')) -- trim leading and trailing whitespace
     end)
-}
+},
+-- Ctrl+Backspace -> Ctrl-W : delete the previous word (nvim insert mode, shells, readline)
+{ key = 'Backspace', mods = 'CTRL', action = act.SendKey { key = 'w', mods = 'CTRL' } },
 
 }
+
 
 
 function tab_title(tab_info)
