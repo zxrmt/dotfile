@@ -69,7 +69,7 @@ g() {
 
 # Alway full permission
 alias yolo="claude --dangerously-skip-permissions"
-alias codex="codex exec --skip-git-repo-check"
+alias codex="codex exec -c mcp_servers.SERVER_NAME.enabled=false --skip-git-repo-check --yolo"
 
 export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 export ENABLE_CLAUDEAI_MCP_SERVERS=false
