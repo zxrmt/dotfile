@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# tmuxa-review — browse the output of every live tmuxa agent window with fzf.
+#
+# tmuxa runs all its sub-agent panes on a PRIVATE tmux socket
+# (~/.cache/tmuxa/tmux.sock) and, once a session dies, persists a cleaned
+# transcript to ~/.cache/tmuxa/sessions/<name>/transcript.txt. This tool lists
+# every session on that socket and shows each pane, live, in an fzf preview.
+#
+#   ENTER   attach to the selected session (read/scroll; detach with `C-b d`)
+#   CTRL-R  reload the session list
+#   CTRL-K  kill the selected session
+#   CTRL-O  open the full scrollback of the selected session in less
+#
+# The preview live-follows by default (re-captures once a second). Launch with
+# TMUXA_FOLLOW=0 for a single static snapshot instead.
+#
+# stdlib + tmux + fzf only. No dependency on the tmuxa python module.
+set -euo pipefail
+
+# fzf and the live preview render multibyte glyphs (e.g. claude's ❯ prompt) as
+# placeholder underscores when the locale isn't UTF-8. This box's login env is
+# POSIX (LANG unset, LC_CTYPE=POSIX), and the popup inherits it, so force a
+# UTF-8 locale here unless the environment already picked one.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]*) : ;;                     # already UTF-8, leave it alone
+    *) export LC_ALL=C.UTF-8 ;;
+esac
+
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tmuxa"
+SOCKET="${TMUXA_SOCKET:-$CACHE/tmux.sock}"
+SESSIONS_DIR="$CACHE/sessions"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+CLAUDE_SESSION="${TMUXA_CLAUDE_SESSION:-claude}"   # name of the interactive scratch session
+export SOCKET SESSIONS_DIR SELF CLAUDE_SESSION
+
+tm() { tmux -S "$SOCKET" "$@"; }
+
+list_sessions() {
+    # name<TAB>status — status is a cheap glance (dead / working / idle) taken
+    # from one capture per session. Sorted so related agents group together.
+    tm list-sessions -F '#{session_name}	#{pane_dead}' 2>/dev/null | sort |
+    while IFS=$'\t' read -r name dead; do
+        if [ "$dead" = "1" ]; then
+            st=$'\033[31mdead\033[0m'
+        elif tm capture-pane -p -t "$name:0.0" -S -6 2>/dev/null |
+             grep -qE '^[[:space:]]*[✢✳✻✽✶✷✸✹✺·].*…'; then
+            st=$'\033[33mworking\033[0m'
+        else
+            st=$'\033[32midle\033[0m'
+        fi
+        printf '%s\t%b\n' "$name" "$st"
+    done
+}
+
+# ── preview: live pane content (or the persisted transcript if the pane is gone)
+preview() {
+    local name="$1"
+    if tm has-session -t "$name" 2>/dev/null; then
+        # Capture the *visible* screen only (no -S/-J). Agent panes render a
+        # wide box-drawing TUI; joining wrapped lines (-J) or pulling the whole
+        # scrollback (-S -) yields lines several times the pane width and mixes
+        # in stale redraws from when the pane was a different size — both wreck
+        # the preview's alignment. The current screen is already wrapped to the
+        # pane width, so it lines up. Full history is still one keypress away
+        # via CTRL-O (dump()).
+        if [ "${TMUXA_FOLLOW:-1}" = "1" ]; then
+            while tm has-session -t "$name" 2>/dev/null; do
+                printf '\033[H\033[2J'          # home + clear (no scrollback wipe)
+                tm capture-pane -p -e -t "$name:0.0" 2>/dev/null
+                sleep 1
+            done
+        else
+            tm capture-pane -p -e -t "$name:0.0" 2>/dev/null
+        fi
+    elif [ -f "$SESSIONS_DIR/$name/transcript.txt" ]; then
+        printf '\033[2m(session ended — persisted transcript)\033[0m\n\n'
+        cat "$SESSIONS_DIR/$name/transcript.txt"
+    else
+        printf '\033[2m(no live pane and no persisted transcript for %s)\033[0m\n' "$name"
+    fi
+}
+
+dump() {  # full scrollback → stdout (for CTRL-O / less)
+    local name="$1"
+    tm capture-pane -p -e -t "$name:0.0" -J -S - 2>/dev/null ||
+        cat "$SESSIONS_DIR/$name/transcript.txt" 2>/dev/null
+}
+
+# ── open this browser inside a tmux popup on the OUTER session.
+# Size comes from the user options @claude_popup_width / @claude_popup_height
+# (default 90%), so ~/.tmux.conf can tune it without touching this script.
+# Note: plain `tmux` here targets the outer/default socket on purpose — the
+# popup belongs to the user's session, while the browser inside it still talks
+# to tmuxa's private socket via tm().
+popup() {
+    local w h
+    w="$(tmux show-option -gqv @claude_popup_width)";  [ -n "$w" ] || w='90%'
+    h="$(tmux show-option -gqv @claude_popup_height)"; [ -n "$h" ] || h='90%'
+    # Don't let the inner exit code escape: cancelling fzf (Esc/C-c) exits 130,
+    # which display-popup returns and run-shell then prints to the status line
+    # as "... returned 130". A cancel is a normal exit, so report success.
+    tmux display-popup -E -w "$w" -h "$h" "$SELF" || true
+    exit 0
+}
+
+# ── open a fresh interactive `claude` in a popup, running on tmuxa's PRIVATE
+# socket (the same one the browser talks to). Living on that socket means the
+# session shows up in the review list next to the agents and survives detach —
+# reopen with <prefix>+u (reattaches) or ENTER it in the review browser.
+#   --new opens the popup on the OUTER socket (like popup());
+#   --run runs INSIDE the popup and creates/reattaches the claude session.
+spawn() {
+    local w h
+    w="$(tmux show-option -gqv @claude_popup_width)";  [ -n "$w" ] || w='90%'
+    h="$(tmux show-option -gqv @claude_popup_height)"; [ -n "$h" ] || h='90%'
+    tmux display-popup -E -w "$w" -h "$h" "$SELF --run" || true
+    exit 0
+}
+
+spawn_run() {
+    # Load the user's keybindings onto the private server (started with
+    # -f /dev/null, so config-free) before attaching — same rationale as the
+    # attach path at the bottom of this script.
+    [ -f "$HOME/.tmux.conf" ] && tm source-file "$HOME/.tmux.conf" 2>/dev/null || true
+    # -A: attach if the session already exists, otherwise create it running
+    # claude. env -u TMUX so a nested attach from an outer tmux isn't refused.
+    exec env -u TMUX tmux -S "$SOCKET" new-session -A -s "$CLAUDE_SESSION" -c "$PWD" \
+        'claude --dangerously-skip-permissions'
+}
+
+# ── internal dispatch used by fzf's preview / bindings
+case "${1:-}" in
+    --popup)   popup ;;
+    --new)     spawn ;;
+    --run)     spawn_run ;;
+    --preview) shift; preview "$@"; exit 0 ;;
+    --dump)    shift; dump    "$@"; exit 0 ;;
+    --list)    list_sessions;       exit 0 ;;
+esac
+
+command -v fzf  >/dev/null || { echo "fzf not found" >&2; exit 1; }
+command -v tmux >/dev/null || { echo "tmux not found" >&2; exit 1; }
+tm has-session 2>/dev/null || tm list-sessions >/dev/null 2>&1 || {
+    echo "no tmuxa server at $SOCKET" >&2; exit 1; }
+
+sel="$(
+    list_sessions | fzf \
+        --ansi --delimiter='\t' --with-nth='2,1' \
+        --preview '"$SELF" --preview {1}' \
+        --preview-window 'up,80%,follow,nocycle,border-bottom' \
+        --header $'ENTER attach · C-r reload · C-k kill · C-o full log\n' \
+        --bind "ctrl-r:reload(\"$SELF\" --list)" \
+        --bind "ctrl-k:execute-silent(tmux -S \"$SOCKET\" kill-session -t {1})+reload(\"$SELF\" --list)" \
+        --bind "ctrl-o:execute(\"$SELF\" --dump {1} | less -R)" \
+    | cut -f1
+)"
+
+[ -n "${sel:-}" ] || exit 0
+
+# Attach outside fzf so tmux gets a clean terminal. Detach the private socket's
+# view from any outer tmux ($TMUX) so nesting doesn't refuse the attach.
+#
+# tmuxa starts its private server with `-f /dev/null` (no config), so an attached
+# client has none of the user's keybindings — default prefix C-b, no binds. Load
+# ~/.tmux.conf onto the server first so the attached session behaves like a normal
+# tmux (prefix C-a, splits, copy-mode, …). set/bind are idempotent, so re-sourcing
+# on each attach is harmless; agent automation uses literal send-keys/paste-buffer
+# (never prefix bindings), so this doesn't affect the running agents.
+[ -f "$HOME/.tmux.conf" ] && tm source-file "$HOME/.tmux.conf" 2>/dev/null || true
+env -u TMUX tmux -S "$SOCKET" attach-session -t "$sel"
+

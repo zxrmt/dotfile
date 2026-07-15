@@ -1,0 +1,1786 @@
+#!/usr/bin/env python3
+"""tmuxa — spawn and drive a Claude Code sub-agent inside a tmux session.
+
+Agent-like delegation: `tmuxa -p "<prompt>"` launches a fresh, visible,
+attachable `claude --dangerously-skip-permissions` session in its own tmux
+session, feeds it the prompt, streams the work to stdout, detects when the
+sub-agent has finished, and returns the final answer — so a parent Claude Code
+instance can consume it like the built-in Agent tool's result.
+
+Single file, python3 stdlib only. See README.md for design notes.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import queue
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths / constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_root() -> pathlib.Path:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    return pathlib.Path(base) / "tmuxa"
+
+CACHE_ROOT = _cache_root()
+SOCKET = str(CACHE_ROOT / "tmux.sock")          # tmux -S <path> (NOT -L: name+broken tmpdir)
+SESSIONS_DIR = CACHE_ROOT / "sessions"
+SELF = os.path.realpath(__file__)               # re-invoked by `tmuxa batch`
+
+DEFAULTS = dict(
+    timeout=600.0,       # wall-clock for the working phase (s)
+    ready_timeout=20.0,  # TUI startup budget (s)
+    idle_secs=4.0,       # quiescence window for idle-completion (s)
+    poll_ms=400,         # poll interval (ms) — each poll forks tmux clients per session;
+                         # 400 keeps the shared-server fork rate sane under many parallel agents
+    agents_poll_ms=1500, # throttle for the `claude agents --json` status poll (ms) — that
+                         # command forks a claude process and returns ALL agents globally, so it
+                         # runs far less often than the frame poll to keep the fork rate sane
+)
+
+RESULT_DELIM = "===== TMUXA RESULT ====="
+
+
+def claude_project_dir(cwd: str) -> pathlib.Path:
+    """The ~/.claude/projects/<enc> dir Claude Code stores a cwd's transcripts in.
+
+    Encoding (verified against the live project dirs): every non-alphanumeric char
+    in the absolute cwd becomes '-' — e.g.
+        /home/zx/firefox       -> -home-zx-firefox
+        /home/zx/.config/nvim  -> -home-zx--config-nvim   (the '.' and both '/' map to '-')."""
+    enc = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(os.path.expanduser(cwd)))
+    return pathlib.Path(os.path.expanduser("~")) / ".claude" / "projects" / enc
+
+
+def claude_transcript_path(cwd: str, session_id: str) -> pathlib.Path:
+    """Deterministic path of Claude Code's native JSONL transcript for a session.
+
+    tmuxa spawns `claude --session-id <uuid>`, so this filename is fixed up front:
+    a parent process can read the real event stream (final answer + tool calls)
+    straight from this file instead of screen-scraping the TUI."""
+    return claude_project_dir(cwd) / f"{session_id}.jsonl"
+
+# Pane geometry: WIDE so the claude TUI does not hard-wrap long lines (e.g. a JSON answer with
+# a long string value) — wrapping mangles structured output that a caller parses. Height only
+# needs to fit the live UI (transcript + input box + footer): committed lines scroll into
+# tmux scrollback, which we read back with `-S` (history-limit 100000), so a tall pane is NOT
+# needed for correctness — and a shorter pane means the claude TUI re-renders far fewer rows on
+# every spinner tick (a big CPU saving with many parallel agents). Override via env if needed.
+PANE_W = int(os.environ.get("TMUXA_PANE_W", "230"))
+PANE_H = int(os.environ.get("TMUXA_PANE_H", "60"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Text cleaning (pure, probe-independent)
+# ────────────────────────────────────────────────────────────────────────────
+
+# CSI / OSC / DCS-PM-APC-SOS / 2-char escapes. DOTALL so OSC/DCS span newlines.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"          # CSI ... final byte
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL or ST
+    r"|\x1b[P^_X][^\x1b]*\x1b\\"         # DCS/PM/APC/SOS ... ST
+    r"|\x1b[@-Z\\-_]",                   # other 2-char escapes
+    re.DOTALL,
+)
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences (SGR, cursor, OSC, bracketed-paste, etc.)."""
+    return _ANSI_RE.sub("", text)
+
+
+def apply_cr(line: str) -> str:
+    """Resolve carriage returns within a single line (progress-bar overwrite).
+
+    Models a cursor returning to column 0 on '\\r' and overwriting in place,
+    so a redrawn progress bar collapses to its final visible state.
+    """
+    buf: list[str] = []
+    col = 0
+    for ch in line:
+        if ch == "\r":
+            col = 0
+        elif ch == "\b":
+            col = max(0, col - 1)
+        else:
+            if col < len(buf):
+                buf[col] = ch
+            else:
+                buf.append(ch)
+            col += 1
+    return "".join(buf)
+
+
+# Box-drawing block U+2500–U+257F (borders, corners, tees) plus heavy/rounded.
+_BOX_ONLY_RE = re.compile(r"^[\s─-╿]+$")
+_VERT_BORDER_RE = re.compile(r"[│┃║]")  # │ ┃ ║
+
+def is_box_border_line(line: str) -> bool:
+    """True if the line is purely box-drawing chars / whitespace (a border)."""
+    s = line.strip()
+    return bool(s) and bool(_BOX_ONLY_RE.match(line))
+
+
+def strip_box_gutter(line: str) -> str:
+    """Strip a leading/trailing vertical box border + padding (input-box gutter)."""
+    line = re.sub(r"^\s*[│┃║]\s?", "", line)
+    line = re.sub(r"\s?[│┃║]\s*$", "", line)
+    return line
+
+
+def clean_frame_text(text: str) -> list[str]:
+    """ANSI/CR-clean a captured frame or log slice into display lines.
+
+    Border-only lines are dropped; gutter borders are stripped from content.
+    Trailing whitespace is trimmed. (Noise-line filtering for the *stream*
+    happens later against SIGNATURES; this is the universal layer.)
+    """
+    text = strip_ansi(text)
+    out: list[str] = []
+    for raw in text.split("\n"):
+        line = apply_cr(raw).rstrip()
+        if is_box_border_line(line):
+            continue
+        out.append(strip_box_gutter(line).rstrip())
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Append-log tail reader (byte offset + partial-sequence carry + rotation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _utf8_need(first: int) -> int:
+    if first < 0x80:
+        return 1
+    if 0xC0 <= first < 0xE0:
+        return 2
+    if 0xE0 <= first < 0xF0:
+        return 3
+    if 0xF0 <= first < 0xF8:
+        return 4
+    return 1  # invalid lead byte; don't carry
+
+
+def _ansi_tail_incomplete(tail: bytes) -> bool:
+    """True if `tail` (starting at an ESC) is an unterminated escape sequence."""
+    if not tail or tail[0] != 0x1B:
+        return False
+    if len(tail) == 1:
+        return True
+    b1 = tail[1]
+    if b1 == ord("["):                       # CSI: ends with 0x40-0x7E
+        return not any(0x40 <= c <= 0x7E for c in tail[2:])
+    if b1 in (ord("]"), ord("P"), ord("^"), ord("_"), ord("X")):  # OSC/DCS/..: ST or BEL
+        return not (b"\x1b\\" in tail or b"\x07" in tail)
+    return False  # 2-char escape already complete with b1
+
+
+def split_partial_tail(data: bytes) -> tuple[bytes, bytes]:
+    """Split off an incomplete trailing UTF-8 char or ANSI escape to carry over."""
+    cut = len(data)
+    # incomplete trailing multibyte UTF-8
+    j = len(data) - 1
+    cont = 0
+    while j >= 0 and (data[j] & 0xC0) == 0x80 and cont < 3:
+        j -= 1
+        cont += 1
+    if j >= 0 and data[j] >= 0x80:
+        need = _utf8_need(data[j])
+        if (len(data) - j) < need:
+            cut = j
+    # incomplete trailing ANSI escape (search within the kept region)
+    esc = data.rfind(0x1B, 0, cut)
+    if esc != -1 and _ansi_tail_incomplete(data[esc:cut]):
+        cut = esc
+    return data[:cut], data[cut:]
+
+
+class LogTail:
+    """Incremental reader over a pipe-pane append-log; never re-emits old bytes."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.offset = 0
+        self._carry = b""
+        self._key: tuple[int, int] | None = None
+
+    def read_new(self) -> str:
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return ""
+        key = (st.st_dev, st.st_ino)
+        if self._key is None:
+            self._key = key
+        elif key != self._key or st.st_size < self.offset:
+            # rotated or truncated → rebase to start
+            self._key, self.offset, self._carry = key, 0, b""
+        with open(self.path, "rb") as f:
+            f.seek(self.offset)
+            chunk = f.read()
+        self.offset += len(chunk)
+        data = self._carry + chunk
+        data, self._carry = split_partial_tail(data)
+        return data.decode("utf-8", "replace")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Native Claude Code transcript — the AUTHORITATIVE completion signal.
+#
+# tmuxa pins `claude --session-id <uuid>`, so the sub-agent's own event stream lands
+# at a deterministic JSONL path (claude_transcript_path). A completed turn ends with
+# an `assistant` record whose message.stop_reason is `end_turn` (or `stop_sequence`);
+# an in-flight tool loop is `tool_use`; a truncated turn is `max_tokens`. Reading that
+# is version-proof, unlike screen-scraping the TUI spinner (see SIGNATURES below), and
+# doesn't false-complete on a multi-minute "Waiting for API" stall. This is the primary
+# done-detector; the TUI FSM (CompletionDetector) is only the fallback when the
+# transcript is unavailable. (Metadata records — mode/permission-mode/custom-title/
+# agent-name/last-prompt/file-history-snapshot/summary/system — are ignored by only
+# tracking assistant/user records.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DONE_STOPS = {"end_turn", "stop_sequence"}   # a settled turn awaiting the next input
+
+
+class TranscriptDetector:
+    """Incremental JSONL tail → completion verdict. Reuses LogTail's byte-offset +
+    partial-line carry so a half-written trailing record (live append) is held over."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._off = 0
+        self._carry = b""
+        self._key: tuple[int, int] | None = None
+        self._last_msg: dict | None = None   # last non-sidechain assistant/user record
+
+    def _pump(self) -> bool:
+        """Ingest new bytes; update self._last_msg. False iff the file is missing/unreadable."""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return False
+        key = (st.st_dev, st.st_ino)
+        if self._key is None:
+            self._key = key
+        elif key != self._key or st.st_size < self._off:   # rotated/truncated → rebase
+            self._key, self._off, self._carry, self._last_msg = key, 0, b"", None
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self._off)
+                chunk = f.read()
+        except OSError:
+            return False
+        self._off += len(chunk)
+        data = self._carry + chunk
+        nl = data.rfind(b"\n")
+        if nl == -1:                    # no complete line yet — carry it all
+            self._carry = data
+            return True
+        complete, self._carry = data[:nl], data[nl + 1:]
+        for raw in complete.split(b"\n"):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if o.get("isSidechain"):
+                continue
+            if o.get("type") in ("assistant", "user"):
+                self._last_msg = o
+        return True
+
+    def verdict(self) -> str | None:
+        """'done' | 'max_tokens' | 'question' | None (working) | 'nofile' (use fallback)."""
+        if not self._pump():
+            return "nofile"
+        o = self._last_msg
+        if o is None or o.get("type") != "assistant":
+            return None   # nothing yet, or a trailing user/tool_result (tools just ran)
+        m = o.get("message") or {}
+        sr = m.get("stop_reason")
+        if sr == "max_tokens":
+            return "max_tokens"          # done, but truncated — caller warns
+        if sr in _DONE_STOPS:
+            return "done"
+        if sr == "tool_use":             # a dangling AskUserQuestion = waiting on the user
+            for c in m.get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use" \
+                        and c.get("name") == "AskUserQuestion":
+                    return "question"
+        return None                      # tool_use in flight → still working
+
+
+def _iter_jsonl_head(path: pathlib.Path, limit: int):
+    """Yield the first `limit` parseable JSON records of a JSONL file (skips blanks/garbage)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= limit:
+                    return
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
+def _jsonl_has_session(path: pathlib.Path, sid: str, limit: int = 20) -> bool:
+    return any((o.get("sessionId") or o.get("session_id")) == sid
+               for o in _iter_jsonl_head(path, limit))
+
+
+def _jsonl_first_user_contains(path: pathlib.Path, needle: str, limit: int = 40) -> bool:
+    """True if the first (non-sidechain) user message in this log contains `needle`."""
+    for o in _iter_jsonl_head(path, limit):
+        if o.get("type") == "user" and not o.get("isSidechain"):
+            c = o.get("message", {}).get("content")
+            text = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+            return needle in text
+    return False
+
+
+def find_transcript_once(cwd: str, session_id: str | None, *, since: float = 0.0,
+                         prompt_needle: str | None = None) -> tuple[str | None, str | None]:
+    """ONE non-blocking locate pass → (path, how). IDENTITY-based, parallel-safe: NEVER
+    selects by mtime alone — a shared cwd (the meta-loop fan-out into /home/zx/firefox holds
+    many concurrent sessions) would cross-wire agents. Preference: (1) the deterministic
+    <session_id>.jsonl → how='deterministic'; (2) a file whose records carry our session_id →
+    'session-id'; (3) the unique file whose first user message contains prompt_needle →
+    'needle'. (2)/(3) mean the deterministic-path assumption broke (filename scheme changed).
+    Returns (None, None) if nothing matched yet."""
+    proj = claude_project_dir(cwd)
+    if session_id and (proj / f"{session_id}.jsonl").exists():
+        return str(proj / f"{session_id}.jsonl"), "deterministic"
+    if not proj.is_dir():
+        return None, None
+    cands = []
+    for p in proj.glob("*.jsonl"):
+        try:
+            if p.stat().st_mtime >= since - 2.0:       # prune obviously-old siblings
+                cands.append(p)
+        except OSError:
+            pass
+    if session_id:
+        for p in cands:
+            if _jsonl_has_session(p, session_id):
+                return str(p), "session-id"
+    if prompt_needle:
+        hits = [p for p in cands if _jsonl_first_user_contains(p, prompt_needle)]
+        if len(hits) == 1:                             # unique → ours; ambiguous → wait
+            return str(hits[0]), "needle"
+    return None, None
+
+
+def resolve_transcript_path(cwd: str, session_id: str | None, *, since: float = 0.0,
+                            prompt_needle: str | None = None, timeout: float = 15.0,
+                            poll: float = 0.3, vlog=None) -> str | None:
+    """Blocking poll wrapper around find_transcript_once (kept for standalone/CLI use).
+    Warns when it has to fall back off the deterministic <session_id>.jsonl path. Returns the
+    path str, or None if nothing matched within `timeout`. NOTE: stream_and_detect does NOT
+    use this — it locates lazily in its poll loop because the interactive TUI writes the
+    transcript with large, variable latency, so blocking here would stall short runs."""
+    deadline = time.time() + timeout
+    while True:
+        path, how = find_transcript_once(cwd, session_id, since=since,
+                                         prompt_needle=prompt_needle)
+        if path:
+            if how != "deterministic":
+                warn(f"deterministic transcript {session_id}.jsonl absent; "
+                     f"identity-matched {os.path.basename(path)} (via {how})")
+            return path
+        if time.time() >= deadline:
+            return None
+        time.sleep(poll)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Claude Code self-reported agent status — `claude agents --json`.
+#
+# This is the SAME completion signal tmux-claude-session-manager reads: every interactive
+# Claude Code session reports its OWN state (busy / idle / waiting) to a supervisor daemon,
+# and `claude agents --json` publishes it keyed by sessionId. Since tmuxa pins
+# `claude --session-id <uuid>`, we look up OUR agent's record directly and map its status:
+#     busy    -> a turn is in flight         (working)
+#     idle    -> the turn settled, our move  (done)
+#     waiting -> blocked on user input       (question, e.g. AskUserQuestion)
+# Like the transcript stop_reason signal this is version-proof (no TUI screen-scrape) and
+# immune to the spinner's API-stall false-idle, but it is even more direct: it is Claude's
+# own notion of whether it is running, not an inference from its output stream — exactly why
+# the session-manager trusts it. `claude agents --json` forks a claude process and returns
+# ALL agents globally, so we poll it on a throttle, not every frame poll (fork-rate hygiene
+# under heavy fan-out).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_AGENT_BUSY, _AGENT_IDLE, _AGENT_WAIT = "busy", "idle", "waiting"
+
+
+def query_claude_agents() -> list | None:
+    """`claude agents --json` → parsed list of agent records, or None if unavailable.
+
+    Returns None on any failure — an old claude without the `agents` subcommand, the
+    supervisor daemon being down, a non-zero exit, or malformed output — so every caller
+    degrades gracefully to the transcript / TUI signal instead of crashing."""
+    try:
+        r = subprocess.run(["claude", "agents", "--json"],
+                           capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def agents_status_by_session(agents: list | None) -> dict:
+    """Map sessionId -> status from a `claude agents --json` payload (as parsed above)."""
+    out: dict[str, str] = {}
+    for a in agents or []:
+        if not isinstance(a, dict):
+            continue
+        sid = a.get("sessionId") or a.get("session_id")
+        st = a.get("status")
+        if sid and st:
+            out[sid] = st
+    return out
+
+
+class AgentsStatusDetector:
+    """Throttled `claude agents --json` → completion verdict for one pinned session_id.
+
+    Mirrors tmux-claude-session-manager's status method. `idle`/`waiting` only count as
+    terminal AFTER we have observed `busy` at least once, so neither the brief pre-turn window
+    (the daemon still reporting the previous idle, before it flips us to busy) nor a momentary
+    registration gap false-completes: until a turn is confirmed in flight we report 'nostatus'
+    and let the transcript / TUI fallback decide — which also covers a turn that finishes faster
+    than our first status poll (we'd never see busy, so we must not claim to know it is done)."""
+
+    def __init__(self, session_id: str, *, min_interval: float, clock=time.time):
+        self.session_id = session_id
+        self.min_interval = min_interval
+        self.clock = clock
+        self._last_poll = 0.0
+        self._saw_busy = False
+        self._verdict: str | None = "nostatus"
+
+    def verdict(self) -> str | None:
+        """'done' | 'question' | None (working) | 'nostatus' (unavailable → use fallback).
+        Throttled: between polls it returns the last computed verdict without forking."""
+        now = self.clock()
+        if now - self._last_poll < self.min_interval:
+            return self._verdict
+        self._last_poll = now
+        agents = query_claude_agents()
+        if agents is None:
+            self._verdict = "nostatus"          # command / daemon unavailable
+            return self._verdict
+        status = agents_status_by_session(agents).get(self.session_id)
+        if status == _AGENT_BUSY:
+            self._saw_busy = True
+            self._verdict = None
+        elif status == _AGENT_IDLE:
+            self._verdict = "done" if self._saw_busy else "nostatus"
+        elif status == _AGENT_WAIT:
+            self._verdict = "question" if self._saw_busy else "nostatus"
+        else:
+            # our session not (yet) listed, or an unrecognised status → defer to fallback
+            self._verdict = "nostatus"
+        return self._verdict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# tmux primitives (all on the private -S socket; no shell interpolation of input)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TmuxError(RuntimeError):
+    pass
+
+
+def have_tmux() -> bool:
+    import shutil
+    return shutil.which("tmux") is not None
+
+
+def tmux(*args: str, input: str | None = None, socket: str = SOCKET,
+         check: bool = False) -> subprocess.CompletedProcess:
+    r = subprocess.run(["tmux", "-S", socket, *args],
+                       input=input, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise TmuxError(f"tmux {' '.join(args[:2])}: {r.stderr.strip()}")
+    return r
+
+
+def server_alive(socket: str = SOCKET) -> bool:
+    return tmux("list-sessions", "-F", "#", socket=socket).returncode == 0
+
+
+def session_exists(name: str, socket: str = SOCKET) -> bool:
+    return tmux("has-session", "-t", name, socket=socket).returncode == 0
+
+
+def new_agent_session(name: str, cwd: str, claude_cmd: str,
+                      env: dict[str, str], socket: str = SOCKET) -> None:
+    """Spawn a detached pane running claude (PID 1 of the pane via exec)."""
+    args = ["-f", "/dev/null", "new-session", "-d", "-s", name,
+            "-x", str(PANE_W), "-y", str(PANE_H), "-c", cwd]
+    for k, v in env.items():
+        args += ["-e", f"{k}={v}"]
+    args.append(claude_cmd)               # tmux runs this via the shell (exec replaces it)
+    tmux(*args, socket=socket, check=True)
+    tmux("set-option", "-t", name, "remain-on-exit", "on", socket=socket)
+    tmux("set-option", "-g", "history-limit", "100000", socket=socket)
+
+
+def attach_pipe(name: str, logpath: str, socket: str = SOCKET) -> None:
+    tmux("pipe-pane", "-t", f"{name}:0.0", "-O", f"cat >> {logpath}", socket=socket)
+
+
+def capture(name: str, *, history: bool = False, escapes: bool = False,
+            start: int | None = None, socket: str = SOCKET) -> str:
+    a = ["capture-pane", "-p", "-t", f"{name}:0.0"]
+    if escapes:
+        a.insert(1, "-e")
+    if history:
+        a += ["-J", "-S", "-"]
+    elif start is not None:
+        a += ["-J", "-S", str(start)]
+    return tmux(*a, socket=socket).stdout
+
+
+def display(name: str, fmt: str, socket: str = SOCKET) -> str:
+    return tmux("display-message", "-p", "-t", f"{name}:0.0", fmt,
+                socket=socket).stdout.strip()
+
+
+def pane_status(name: str, socket: str = SOCKET) -> tuple[bool, int | None, str]:
+    """Return (dead, exit_code_or_None, current_command)."""
+    s = display(name, "#{pane_dead}|#{pane_dead_status}|#{pane_current_command}",
+                socket=socket)
+    dead_s, status_s, cmd = (s.split("|", 2) + ["", "", ""])[:3]
+    code = int(status_s) if status_s.strip().lstrip("-").isdigit() else None
+    return dead_s == "1", code, cmd
+
+
+# Printable fence: `display-message` octal-escapes a control byte (e.g. \x01 -> "\001"),
+# so a non-printable sentinel does NOT survive — use ASCII that won't open a capture frame.
+_STATUS_SENTINEL = "@@TMUXA_PS@@"
+
+
+def capture_with_status(name: str, *, start: int | None = None,
+                        socket: str = SOCKET) -> tuple[str, tuple[bool, int | None, str]]:
+    """capture-pane + pane status in ONE tmux client fork → (frame, (dead, code, cmd)).
+
+    A streaming poll needs both the live frame and pane_dead/exit-code; issuing them as two
+    `tmux` invocations doubles the process-creation rate, the dominant tmuxa CPU cost under
+    many parallel agents. Chaining `display-message ; capture-pane` in a single client returns
+    both: the status line comes first, fenced by _STATUS_SENTINEL, and the frame is everything
+    after the closing fence (we only ever read the first two fences, so a fence appearing
+    inside the captured TUI text cannot confuse the split)."""
+    fmt = (_STATUS_SENTINEL + "#{pane_dead}|#{pane_dead_status}|#{pane_current_command}"
+           + _STATUS_SENTINEL)
+    cap = ["capture-pane", "-p", "-t", f"{name}:0.0"]
+    if start is not None:
+        cap += ["-J", "-S", str(start)]
+    out = tmux("display-message", "-p", "-t", f"{name}:0.0", fmt, ";", *cap,
+               socket=socket).stdout
+    dead, code, cmd, frame = False, None, "", out
+    if out.startswith(_STATUS_SENTINEL):
+        end = out.find(_STATUS_SENTINEL, len(_STATUS_SENTINEL))
+        if end != -1:
+            status = out[len(_STATUS_SENTINEL):end]
+            frame = out[end + len(_STATUS_SENTINEL):]
+            if frame.startswith("\n"):
+                frame = frame[1:]
+            dead_s, code_s, cmd = (status.split("|", 2) + ["", "", ""])[:3]
+            code = int(code_s) if code_s.strip().lstrip("-").isdigit() else None
+            dead = dead_s == "1"
+    return frame, (dead, code, cmd)
+
+
+def send_key(name: str, key: str, socket: str = SOCKET) -> None:
+    tmux("send-keys", "-t", f"{name}:0.0", key, socket=socket)
+
+
+def load_and_paste(name: str, data: str, socket: str = SOCKET) -> None:
+    """Inject arbitrary text as inert bytes (no shell), bracketed so multi-line
+    stays one input block.
+
+    Uses a per-session NAMED buffer (-b): tmux paste buffers are global to the
+    server, so without a unique name, concurrent sends to different sessions on
+    the shared socket race and cross prompts. -d drops the buffer after paste.
+    """
+    buf = f"tmuxa_{name}"
+    tmux("load-buffer", "-b", buf, "-", input=data, socket=socket, check=True)
+    tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", f"{name}:0.0",
+         socket=socket, check=True)
+
+
+def kill_session(name: str, socket: str = SOCKET) -> None:
+    tmux("kill-session", "-t", name, socket=socket)
+
+
+def list_session_names(socket: str = SOCKET) -> list[str]:
+    r = tmux("list-sessions", "-F", "#{session_name}", socket=socket)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session bookkeeping
+# ─────────────────────────────────────────────────────────────────────────────
+
+def unique_name(prefix: str = "agent") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def session_dir(name: str) -> pathlib.Path:
+    d = SESSIONS_DIR / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def write_meta(name: str, meta: dict) -> None:
+    (session_dir(name) / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+def read_meta(name: str) -> dict:
+    try:
+        return json.loads((SESSIONS_DIR / name / "meta.json").read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Credentials — tmuxa no longer manages an account pool. The caller supplies the
+# API token/endpoint/model via the environment (ANTHROPIC_AUTH_TOKEN /
+# ANTHROPIC_BASE_URL / ANTHROPIC_*_MODEL) and/or `--model`; cmd_run forwards every
+# ANTHROPIC_*/CLAUDE_* env var to the spawned claude pane. In pijs, runner.py reads
+# config.py and FEEDS the chosen credential to the tmuxa command this way. With no
+# token in the environment, claude in the pane uses its own ~/.claude login.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNATURES — version-fragile regexes, pinned from probe frames (claude 2.1.179).
+# Update these (and tests/fixtures) if the Claude Code TUI layout changes.
+# Validated layout:
+#   ❯ <text>     user prompt echoed into the transcript
+#   ● <text>     assistant message / tool-use bullet
+#   · Warping…   transient working spinner (glyph animates: · ✶ ✳ ✻ …)
+#   ✻ Baked for 5s   transient "last turn took" timer
+#   ───…── <name> ──   input-box top rule (carries the -n display name)
+#   ✢ Warping…   working spinner, rendered JUST ABOVE the box rule ⇒ a turn is RUNNING
+# NOTE: the footer hint is NOT a reliable running/idle signal anymore. Claude Code
+# 2.1.198 dropped "esc to interrupt" and shows "… · ← for agents" even WHILE working,
+# and a custom `statusLine` can rewrite the footer entirely. The version-proof signal
+# is the built-in spinner (animation glyph + gerund…) above the box — see is_working().
+# ─────────────────────────────────────────────────────────────────────────────
+
+SIG = {
+    "trust": re.compile(r"trust this folder|project you created or one you trust", re.I),
+    "theme": re.compile(r"Choose the text style|Select your theme|to use dark mode", re.I),
+    "press_enter": re.compile(r"Press Enter to continue|❯\s*1\.\s", re.I),
+    "working": re.compile(r"esc to interrupt"),
+    "assistant": re.compile(r"^●\s"),     # ●
+    "prompt_echo": re.compile(r"^❯\s"),   # ❯
+    # interactive AskUserQuestion multiple-choice widget (replaces the input box)
+    "question_widget": re.compile(r"Enter to select|↑/↓ to navigate"),
+}
+
+_STATUS_GLYPHS = set("·∙⋅•◦‣⁂✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀⭐")
+_STATUS_GLYPHS |= {chr(c) for c in range(0x2800, 0x2900)}  # braille spinner cells
+_BARE_GERUND = re.compile(r"^[A-Za-z][\w'’-]*…$")      # Warping…
+_TIMER_TAIL = re.compile(r"\bfor \d+s$")
+
+
+def is_status_line(line: str) -> bool:
+    """Transient spinner / timer line (noise). Never matches ● or ❯ lines."""
+    s = line.strip()
+    if not s:
+        return False
+    if SIG["assistant"].match(s) or SIG["prompt_echo"].match(s):
+        return False
+    if s[0] in _STATUS_GLYPHS:
+        return True
+    if _BARE_GERUND.match(s):
+        return True
+    if _TIMER_TAIL.search(s) and len(s.split()) <= 4:
+        return True
+    return False
+
+
+def _rule_re(name: str) -> re.Pattern:
+    # input-box top rule carries the display name: "──── <name> ──"
+    return re.compile(r"\b" + re.escape(name) + r"\s+─")
+
+
+def _input_region(frame: str, name: str) -> str:
+    """The live UI region: the named input-box rule and the few lines below it
+    (input + bottom rule + footer). Scoping here avoids matching a stale footer
+    that may have scrolled up into the transcript history."""
+    lines = frame.split("\n")
+    rule = _rule_re(name)
+    for i in range(len(lines) - 1, -1, -1):
+        if rule.search(lines[i]):
+            return "\n".join(lines[i:i + 6])
+    return ""
+
+
+# Claude's built-in "working" spinner sits JUST ABOVE the input-box rule while a turn
+# runs, and vanishes the instant the turn ends — so it, NOT the drifting footer hint,
+# is the version-proof "is a turn running" signal. Observed forms (Claude Code 2.1.198):
+#   ✢ Warping…                                             (bare gerund)
+#   ✽ Manifesting… (1m 58s · almost done thinking …)       (gerund + live timer)
+#   ✻ Moseying… (90s · ↓ 38.0k tokens)                     (gerund + live timer)
+#   ✻ Waiting for API response · will retry in 2m 40s …    (API stall — NO gerund/timer!)
+# The last form is a transient API overload/network stall: the agent is STILL mid-turn
+# and will resume, so it must read as "working" or tmuxa completes on it after idle_secs
+# (this is the failure that killed the round-2 planner during a 2m40s retry).
+_GERUND       = re.compile(r"[A-Za-z][\w'’-]*…")          # "Warping…", "Manifesting…"
+_LIVE_ELAPSED = re.compile(r"\((?:\d+\s*m\s*)?\d+\s*s\b")  # live timer "(12s" / "(1m 7s"
+# Transient not-done spinner states whose text is NOT a gerund. These strings appear in
+# the spinner line ONLY while a turn is in flight (never in a settled, idle frame), so
+# matching them cannot false-positive on a completed answer.
+_BUSY_TEXT = re.compile(
+    r"esc to interrupt|Waiting for API|will retry|retrying|reconnect|resuming|"
+    r"check your network|API Error|overloaded|rate.?limit|offline|stream", re.I)
+_BOX_RULE = re.compile(r"─{20,}")    # a full-width input-box horizontal rule
+
+
+def _box_top_index(lines: list[str], name: str):
+    """Index of the input-box TOP rule. Prefer the NAMED rule (precise); else fall back
+    to the box's SHAPE — the last pair of full-width ─ rules at the bottom of the frame.
+    The name is not always rendered into the rule (version/width dependent), and when it
+    is missing the spinner zone must still be found — otherwise is_working goes blind and
+    a long think or API stall looks 100% idle. Returns None if no box is visible."""
+    rule = _rule_re(name)
+    for i in range(len(lines) - 1, -1, -1):
+        if rule.search(lines[i]):
+            return i
+    rule_idxs = [i for i, l in enumerate(lines) if _BOX_RULE.search(l)]
+    if not rule_idxs:
+        return None
+    # the input box is the last two rules (TOP, BOTTOM); its TOP is the second-to-last
+    return rule_idxs[-2] if len(rule_idxs) >= 2 else rule_idxs[-1]
+
+
+def _spinner_zone(frame: str, name: str) -> list[str]:
+    """The few lines just ABOVE the input-box TOP rule, where the working spinner
+    renders. Deliberately excludes the box, statusline and footer BELOW it: those carry
+    a user-customizable `statusLine` we must not treat as agent activity. Empty when no
+    input box is visible — never scan the statusline."""
+    lines = frame.split("\n")
+    idx = _box_top_index(lines, name)
+    if idx is None:
+        return []
+    return lines[max(0, idx - 4):idx]
+
+
+def _is_spinner_line(line: str) -> bool:
+    """A working-spinner line: an optional animation glyph, then a gerund ending in '…'
+    ("✢ Warping…"). Excludes the post-turn 'Baked for 5s' timer (no '…')."""
+    s = line.strip()
+    if not s:
+        return False
+    if s[0] in _STATUS_GLYPHS:          # strip the leading animation glyph, if any
+        s = s[1:].lstrip()
+    return bool(_GERUND.match(s))        # first token must be a gerund ("Warping…")
+
+
+def is_working(frame: str, name: str) -> bool:
+    """True iff a turn is running. Robust to Claude Code footer/statusLine drift: in the
+    zone above the input box, detect the spinner (glyph + gerund…), a live elapsed timer,
+    or a transient API-stall/retry line; then fall back to the legacy 'esc to interrupt'
+    hint for older TUIs. See also the motion backstop in CompletionDetector.verdict()."""
+    for line in _spinner_zone(frame, name):
+        if _is_spinner_line(line):
+            return True
+        # A live-timer / API-stall spinner carries no gerund, but Claude ALWAYS renders it
+        # with a leading animation glyph ("✻ Waiting for API response · will retry …",
+        # "✽ Manifesting… (1m 2s …)"), so gate _LIVE_ELAPSED/_BUSY_TEXT on that glyph.
+        # Ungated, these generic patterns also match ordinary ANSWER prose: the tail of a
+        # long ● answer wraps into the spinner zone just above the box, and a word like
+        # "stream"/"downstream"/"offline" trips _BUSY_TEXT — pinning is_working True on a
+        # finished, idle agent until the wall-clock timeout (the merge_targets hang).
+        s = line.strip()
+        if s and s[0] in _STATUS_GLYPHS and (_LIVE_ELAPSED.search(line)
+                                             or _BUSY_TEXT.search(line)):
+            return True
+    return bool(SIG["working"].search(_input_region(frame, name)))
+
+
+def _zone_has_glyph(zone: list[str]) -> bool:
+    """True if any line in the spinner zone starts with an animation glyph — i.e. a
+    spinner is present (of unknown text). Used to gate the motion backstop so a static
+    markdown bullet in a settled answer can't be mistaken for an animating spinner."""
+    for line in zone:
+        s = line.strip()
+        if s and s[0] in _STATUS_GLYPHS:
+            return True
+    return False
+
+
+def input_box_present(frame: str, name: str) -> bool:
+    return any(_rule_re(name).search(l) for l in frame.split("\n"))
+
+
+def collapse_blanks(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def clean_capture(text: str) -> list[str]:
+    """Clean a capture-pane frame into readable transcript lines: strip ANSI/CR,
+    drop box borders + gutters, trim blank padding, collapse blank runs."""
+    lines = [strip_box_gutter(apply_cr(strip_ansi(l))).rstrip() for l in text.split("\n")]
+    lines = [l for l in lines if not is_box_border_line(l)]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    out: list[str] = []
+    for l in lines:
+        if not l.strip() and out and not out[-1].strip():
+            continue
+        out.append(l)
+    return out
+
+
+def cleaned_after_prompt(full: str, name: str) -> str:
+    """Cleaned visible content after the echoed prompt — used as a fallback answer
+    when there is no ● assistant block (e.g. an interactive question widget, or a
+    timeout/crash before any reply)."""
+    lines = clean_capture(full)
+    idx = -1
+    for i, l in enumerate(lines):
+        if l.startswith("❯ ") and len(l.strip()) > 2:   # the echoed user prompt
+            idx = i
+    if idx >= 0:
+        lines = lines[idx + 1:]
+    lines = [l for l in lines if l.strip() != "❯"]       # drop the empty input line
+    return collapse_blanks("\n".join(lines)).strip()
+
+
+def split_frame(frame: str, name: str) -> tuple[list[str], bool]:
+    """Split a captured frame into (response_lines, has_input_box).
+
+    response_lines = cleaned transcript from the first assistant bullet that
+    follows our prompt echo, up to the input-box rule. This skips the welcome
+    banner and the echoed prompt; status/spinner lines are kept (callers filter).
+    """
+    lines = frame.split("\n")
+    rule = _rule_re(name)
+    boundary = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if rule.search(lines[i]):
+            boundary = i
+            break
+    has_box = boundary < len(lines)
+    resp: list[str] = []
+    seen_echo = False
+    started = False
+    for raw in lines[:boundary]:
+        line = strip_box_gutter(apply_cr(strip_ansi(raw))).rstrip()
+        if is_box_border_line(line) or rule.search(line):
+            continue
+        if not started:
+            if not seen_echo and SIG["prompt_echo"].search(line):
+                seen_echo = True
+                continue
+            if seen_echo and SIG["assistant"].search(line):
+                started = True
+                resp.append(line)
+            continue
+        resp.append(line)
+    return resp, has_box
+
+
+def answer_from_response(resp: list[str], marker: str | None = None) -> str:
+    """Extract the final assistant answer (last ● block) from response lines."""
+    bullets = [i for i, l in enumerate(resp) if SIG["assistant"].search(l)]
+    if bullets:
+        start = bullets[-1]
+        body = [re.sub(r"^●\s+", "", resp[start])]
+        for l in resp[start + 1:]:
+            if is_status_line(l) or SIG["assistant"].search(l) or SIG["prompt_echo"].search(l):
+                break
+            body.append(l)
+    else:
+        body = [l for l in resp if not is_status_line(l)]
+    text = "\n".join(body)
+    if marker:
+        text = text.replace(marker, "")
+    text = re.sub(r"\(\s*System note to the assistant.*?\)", "", text, flags=re.S)
+    return collapse_blanks(text).strip()
+
+
+class FrameDiffer:
+    """Emit only newly-stable response lines across capture frames.
+
+    A line is committed once it is identical in two consecutive frames, so a
+    still-streaming last line is held back until it settles. Trailing blank lines
+    are dropped to keep indices append-aligned. flush() emits whatever remains.
+    Live streaming is cosmetic; the authoritative answer comes from the final
+    capture via answer_from_response(), so an occasional glitch here is harmless.
+    """
+
+    def __init__(self, name: str, marker: str | None = None):
+        self.name = name
+        self.marker = marker
+        self.emitted = 0
+        self._prev: list[str] = []
+
+    def _post(self, resp: list[str]) -> list[str]:
+        """Filter split_frame() output down to streamable lines (drop spinners,
+        the sentinel marker, trailing blanks). Takes the already-split response so
+        the caller can share one split_frame() pass with the completion detector."""
+        resp = [l for l in resp if not is_status_line(l)]
+        if self.marker:
+            resp = [l for l in resp if self.marker not in l]
+        while resp and not resp[-1].strip():
+            resp.pop()
+        return resp
+
+    def commit_new(self, resp: list[str]) -> list[str]:
+        resp = self._post(resp)
+        prev, self._prev = self._prev, resp
+        stable = 0
+        n = min(len(resp), len(prev))
+        while stable < n and resp[stable] == prev[stable]:
+            stable += 1
+        new = resp[self.emitted:stable]
+        self.emitted = max(self.emitted, stable)
+        return new
+
+    def flush(self, resp: list[str]) -> list[str]:
+        resp = self._post(resp)
+        new = resp[self.emitted:]
+        self.emitted = max(self.emitted, len(resp))
+        self._prev = resp
+        return new
+
+
+class CompletionDetector:
+    """Hybrid completion FSM: sentinel (primary) + footer-idle (fallback)."""
+
+    def __init__(self, name: str, marker: str | None, idle_secs: float,
+                 clock=time.time):
+        self.name = name
+        self.marker = marker
+        self.idle_secs = idle_secs
+        self.clock = clock
+        self.saw_working = False
+        self._idle_since: float | None = None
+        self._last_zone: str | None = None
+
+    def verdict(self, frame: str, resp: list[str], has_box: bool,
+                status: tuple[bool, int | None, str] | None = None
+                ) -> tuple[str | None, object]:
+        # `resp`/`has_box` are split_frame(frame) computed once by the caller and shared
+        # with the FrameDiffer, so a poll does a single split pass, not two. `status` is the
+        # pane (dead, code, cmd) fetched in the SAME tmux fork as `frame` (capture_with_status)
+        # so a poll forks tmux once, not twice; fall back to a dedicated fork if not supplied.
+        dead, code, _ = status if status is not None else pane_status(self.name)
+        if dead:
+            return "crash", code
+        working = is_working(frame, self.name)
+        # Motion backstop (display-agnostic): an animation glyph is present above the box
+        # AND the spinner zone changed since the last poll ⇒ a turn is animating (spinner
+        # cycling, timer ticking, retry counting down) even if its text matches none of the
+        # patterns above. Gated on a glyph so a static markdown bullet in a settled answer
+        # can't trip it, and scoped above the box so a custom statusLine clock can't either.
+        zone = _spinner_zone(frame, self.name)
+        zone_text = "\n".join(zone)
+        if not working and _zone_has_glyph(zone) and self._last_zone is not None \
+                and zone_text != self._last_zone:
+            working = True
+        self._last_zone = zone_text
+        if working:
+            self.saw_working = True
+            self._idle_since = None
+            return None, None
+
+        # interactive multiple-choice question (AskUserQuestion) — it replaces the
+        # input box, so handle it before the input-box-based idle logic below.
+        if SIG["question_widget"].search(frame):
+            if self._idle_since is None:
+                self._idle_since = self.clock()
+            elif self.clock() - self._idle_since >= min(self.idle_secs, 2.0):
+                return "question", None
+            return None, None
+
+        resp_text = "\n".join(resp)
+        answered = any(SIG["assistant"].search(l) for l in resp)
+
+        # sentinel: the agent emitted the marker in its response region
+        if self.marker and self.marker in resp_text:
+            return "sentinel", None
+
+        # footer-idle: a turn ran (or a response exists) and the box is idle
+        if has_box and (self.saw_working or answered):
+            now = self.clock()
+            if self._idle_since is None:
+                self._idle_since = now
+            elif now - self._idle_since >= self.idle_secs:
+                tail = [l for l in resp if l.strip() and not is_status_line(l)]
+                if answered and tail and tail[-1].rstrip().endswith("?"):
+                    return "question", None
+                return "idle", None
+        else:
+            self._idle_since = None
+        return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestration (the -p flow)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReadyTimeout(Exception):
+    pass
+
+
+class ClaudeExited(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(str(code))
+
+
+_STATE = {"name": None, "keep": False}
+
+
+def _on_signal(signum, frame):
+    name = _STATE.get("name")
+    if name and not _STATE.get("keep"):
+        try:
+            kill_session(name)
+        except Exception:
+            pass
+    sys.exit(130)
+
+
+def make_vlog(verbose: bool):
+    def vlog(msg: str):
+        if verbose:
+            print(f"[tmuxa] {msg}", file=sys.stderr, flush=True)
+    return vlog
+
+
+def warn(msg: str) -> None:
+    """Always-on stderr warning (NOT gated on --verbose): emitted whenever tmuxa
+    takes a degraded/fallback path (transcript not found, identity-matched instead
+    of the deterministic path, TUI screen-scrape fallback, truncated output). Safe
+    against callers: they drain tmuxa's stderr on a separate pipe (see runner.py),
+    so this never corrupts the stdout RESULT_DELIM / --json parsing."""
+    print(f"[tmuxa] warning: {msg}", file=sys.stderr, flush=True)
+
+
+def ensure_dirs() -> None:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def make_marker() -> str:
+    return f"<<TMUXA_DONE_{uuid.uuid4().hex[:8]}>>"
+
+
+def sentinel_instruction(marker: str) -> str:
+    return ("\n\n( System note to the assistant running this task: when the task is "
+            "fully complete and you have given your final answer, print this exact line "
+            f"by itself as your very last output, then stop — {marker} )")
+
+
+def read_prompt(opts) -> str:
+    if opts.prompt_file:
+        return pathlib.Path(os.path.expanduser(opts.prompt_file)).read_text()
+    if opts.prompt == "-":
+        return sys.stdin.read()
+    return opts.prompt or ""
+
+
+def build_claude_cmd(name: str, opts) -> str:
+    parts = ["exec", "claude", "--dangerously-skip-permissions","-n", shlex.quote(name)]
+    if getattr(opts, "session_id", None):
+        # Pin Claude Code's session id so its native transcript path is deterministic
+        # (cmd_run resolves/validates opts.session_id; see claude_transcript_path).
+        parts += ["--session-id", shlex.quote(opts.session_id)]
+    if opts.model:
+        parts += ["--model", shlex.quote(opts.model)]
+    # Reasoning effort + tool allow/deny lists, forwarded verbatim to the claude TUI.
+    # `--tools`/`--disallowedTools` let a caller pin the sub-agent to a read-only
+    # toolset (e.g. Bash,Read) even though the session runs --dangerously-skip-permissions.
+    if getattr(opts, "effort", None):
+        parts += ["--effort", shlex.quote(opts.effort)]
+    if getattr(opts, "tools", None):
+        parts += ["--tools", shlex.quote(opts.tools)]
+    if getattr(opts, "disallowed_tools", None):
+        parts += ["--disallowedTools", shlex.quote(opts.disallowed_tools)]
+    if opts.append_system_prompt:
+        parts += ["--append-system-prompt", shlex.quote(opts.append_system_prompt)]
+    return " ".join(parts)
+
+
+def wait_until_ready(name: str, ready_timeout: float, poll: float, vlog) -> None:
+    deadline = time.time() + ready_timeout
+    dismissed = 0
+    hits = 0
+    while time.time() < deadline:
+        dead, code, _ = pane_status(name)
+        if dead:
+            raise ClaudeExited(code)
+        frame = capture(name)
+        is_startup_prompt = (SIG["trust"].search(frame) or SIG["theme"].search(frame)
+                             or SIG["press_enter"].search(frame))
+        if dismissed < 6 and is_startup_prompt and not input_box_present(frame, name):
+            vlog("dismissing a startup prompt (Enter = accept default)")
+            send_key(name, "Enter")
+            dismissed += 1
+            time.sleep(0.7)
+            continue
+        if input_box_present(frame, name) and not is_working(frame, name):
+            hits += 1
+            if hits >= 2:
+                vlog("input box ready")
+                return
+        else:
+            hits = 0
+        time.sleep(poll)
+    raise ReadyTimeout()
+
+
+def send_prompt(name: str, full: str, marker: str | None, poll: float, vlog) -> None:
+    load_and_paste(name, full)
+    needle = marker or (full.strip().splitlines() or [""])[-1][:30]
+    t = time.time()
+    while time.time() - t < 8:
+        if not needle or needle in capture(name):
+            break
+        time.sleep(0.1)
+    time.sleep(0.15)  # let the paste settle before submitting
+    send_key(name, "Enter")
+    vlog("prompt submitted")
+    t = time.time()
+    while time.time() - t < 6:
+        f = capture(name)
+        if is_working(f, name) or any(SIG["assistant"].search(l) for l in split_frame(f, name)[0]):
+            return
+        time.sleep(0.15)
+    vlog("no turn detected after submit; re-sending Enter")
+    send_key(name, "Enter")
+
+
+def _transcript_mtime(path) -> float:
+    """mtime of the native JSONL transcript, or -1.0 if unknown/missing (→ no backoff).
+    A cheap stat (no process fork) used to pace polling off real agent activity."""
+    if not path:
+        return -1.0
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return -1.0
+
+
+def stream_and_detect(name: str, marker: str | None, opts, vlog):
+    differ = FrameDiffer(name, marker)
+    detector = CompletionDetector(name, marker, opts.idle_secs)
+    poll = opts.poll_ms / 1000.0
+    # Adaptive backoff: pace the poll off REAL transcript growth (a cheap mtime stat, no
+    # fork), not the wall clock. While the native JSONL is not growing — the agent is deep in
+    # a think or inside a long tool call (the footer still says "working", so completion stays
+    # gated by is_working) — stretch the interval up to backoff_cap to cut the tmux fork rate;
+    # any new transcript record snaps it straight back to the base interval. The cap stays
+    # under idle_secs so idle/sentinel detection keeps its granularity.
+    # Completion is PRIMARY from the native JSONL transcript (version-proof); the TUI FSM
+    # (CompletionDetector) is the BRIDGE until that file appears and the FALLBACK if it never
+    # does. The interactive TUI writes <sid>.jsonl with large/variable latency, so we locate
+    # it LAZILY here rather than blocking up front: a cheap deterministic stat every poll, the
+    # heavier identity glob-scan only ~1×/s while still missing.
+    det_path = getattr(opts, "claude_transcript", None)
+    rcwd = getattr(opts, "resolve_cwd", None)
+    sid = getattr(opts, "session_id", None)
+    needle = getattr(opts, "prompt_needle", None)
+    since = getattr(opts, "spawn_ts", 0.0)
+    # PRIMARY completion signal: Claude's own self-reported status (`claude agents --json`),
+    # the same method tmux-claude-session-manager uses. Keyed by our pinned session_id; None
+    # when disabled or no sid, in which case detection is unchanged (transcript then TUI).
+    adet = (AgentsStatusDetector(sid, min_interval=opts.agents_poll_ms / 1000.0)
+            if sid and getattr(opts, "agents_status", True) else None)
+    tdet: TranscriptDetector | None = None
+    transcript = det_path          # path used for mtime-paced backoff (updated once located)
+    tui_warned = False
+    last_scan = 0.0
+    backoff_cap = max(poll, min(1.2, opts.idle_secs * 0.5))
+    last_mtime, cur = -1.0, poll
+    deadline = time.time() + opts.timeout
+    completion, detail = "timeout", None
+    while time.time() < deadline:
+        # Bounded window, NOT full history: detection + live streaming only need the live
+        # region (prompt echo → input box); re-serializing the entire 100k-line scrollback
+        # every poll is O(transcript). The authoritative answer is the native transcript
+        # (cmd_run); this scrape is only the live ticker + a fallback. capture_with_status
+        # folds the pane (dead/exit) into the SAME fork, so a poll forks tmux once, not twice.
+        frame, status = capture_with_status(name, start=-1500)
+        resp, has_box = split_frame(frame, name)   # one split pass, shared below
+        if not opts.quiet:
+            for line in differ.commit_new(resp):
+                sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+        # Crash first — the transcript cannot report that the process died (pane is kept
+        # alive by remain-on-exit precisely so we can read the exit code here).
+        dead, code, _ = status
+        if dead:
+            completion, detail = "crash", code
+            vlog("completion=crash")
+            break
+
+        now = time.time()
+
+        # PRIMARY completion signal: Claude's own self-reported status (`claude agents --json`),
+        # the same method tmux-claude-session-manager reads. When it returns a definitive answer
+        # it is authoritative — we do NOT consult the transcript/TUI this poll; only 'nostatus'
+        # (command unavailable, or a turn not yet/never confirmed busy) falls through to them.
+        av = adet.verdict() if adet is not None else "nostatus"
+        if av == "done":
+            completion, detail = "done", None
+            vlog("completion=done (claude agents status=idle)")
+            break
+        if av == "question" and opts.on_question != "wait":
+            completion, detail = "question", None
+            vlog("completion=question (claude agents status=waiting)")
+            break
+
+        if av == "nostatus":
+            # Status unavailable → the existing transcript-primary, TUI-fallback detection.
+            # Lazily locate the transcript: cheap deterministic stat every poll, identity glob
+            # scan only ~1×/s while still missing (keeps the fork/IO rate sane under fan-out).
+            if tdet is None and (det_path or rcwd):
+                path, how = (None, None)
+                if det_path and os.path.exists(det_path):
+                    path, how = det_path, "deterministic"
+                elif rcwd and now - last_scan >= 1.0:
+                    last_scan = now
+                    path, how = find_transcript_once(rcwd, sid, since=since, prompt_needle=needle)
+                if path:
+                    tdet = TranscriptDetector(path)
+                    transcript = path
+                    if how != "deterministic":
+                        warn(f"deterministic transcript {sid}.jsonl not found; using "
+                             f"identity-matched {os.path.basename(path)} (via {how})")
+                    vlog(f"transcript located ({how}): {path}")
+
+            if tdet is not None:
+                tv = tdet.verdict()
+                if tv == "nofile":
+                    warn("native transcript disappeared mid-run; falling back to TUI "
+                         "screen-scrape for completion detection")
+                    tdet = None                        # rest of the run uses the TUI FSM
+                elif tv == "done":
+                    completion, detail = "done", None
+                    vlog("completion=done (transcript end_turn)")
+                    break
+                elif tv == "max_tokens":
+                    warn("sub-agent turn ended on max_tokens (output truncated)")
+                    completion, detail = "done", None
+                    vlog("completion=done (transcript max_tokens; truncated)")
+                    break
+                elif tv == "question" and opts.on_question != "wait":
+                    completion, detail = "question", None
+                    vlog("completion=question (transcript AskUserQuestion)")
+                    break
+                # tv None (or a suppressed question under --on-question wait) → still working.
+                # While the transcript is authoritative we do NOT consult the TUI FSM — that is
+                # exactly what makes us immune to the spinner-scrape's API-stall false-idle.
+            else:
+                # TUI FSM — version-fragile spinner/idle scrape, used only as the bridge before
+                # the transcript appears / the fallback if it never does. Warn once when it is
+                # what actually decides completion (the user asked to be told on any fallback).
+                verdict, d = detector.verdict(frame, resp, has_box, status)
+                if verdict == "question" and opts.on_question == "wait":
+                    verdict = None
+                if verdict:
+                    if not tui_warned:
+                        warn("completion decided by TUI screen-scrape fallback (native "
+                             "transcript did not appear in time); less reliable than the "
+                             "transcript stop_reason signal")
+                        tui_warned = True
+                    completion, detail = verdict, d
+                    vlog(f"completion={verdict} (TUI fallback)")
+                    break
+        # else: av is None (busy) or a suppressed question under --on-question wait →
+        # authoritatively still working; skip the fallbacks and just pace the next poll.
+
+        mtime = _transcript_mtime(transcript)
+        if mtime > last_mtime:
+            last_mtime, cur = mtime, poll          # fresh activity → poll fast
+        elif mtime >= 0:
+            cur = min(backoff_cap, cur * 1.5)      # quiescent → ease off
+        time.sleep(cur)
+
+    full = capture(name, history=True)
+    try:  # persist a clean transcript so `tmuxa logs` works after the session dies
+        (SESSIONS_DIR / name / "transcript.txt").write_text("\n".join(clean_capture(full)))
+    except OSError:
+        pass
+    resp, _ = split_frame(full, name)
+    if not opts.quiet:
+        # flush from the full-history split so any lines that scrolled past the live
+        # window during streaming are still emitted (indices share the same origin —
+        # the first ● after the prompt echo — so emitted stays aligned).
+        for line in differ.flush(resp):
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    if opts.full_transcript:
+        body = "\n".join(l for l in resp if not is_status_line(l))
+        if marker:
+            body = body.replace(marker, "")
+        answer = collapse_blanks(body).strip()
+    else:
+        answer = answer_from_response(resp, marker)
+    if not answer:  # no ● block: question widget, or timeout/crash before a reply
+        answer = cleaned_after_prompt(full, name)
+    return completion, detail, answer
+
+
+def exit_code_for(completion: str) -> int:
+    return {"sentinel": 0, "idle": 0, "done": 0, "question": 0,
+            "timeout": 3, "crash": 5}.get(completion, 0)
+
+
+def emit_result(name, completion, detail, answer, opts) -> None:
+    meta = read_meta(name)
+    elapsed = round(time.time() - meta.get("started_at", time.time()), 1)
+    if opts.json:
+        print(json.dumps({
+            "result": answer,
+            "completion": completion,
+            "needs_input": completion == "question",
+            "exit_code": exit_code_for(completion),
+            "session": name,
+            "account": meta.get("account"),
+            "elapsed_s": elapsed,
+            "transcript_path": str(SESSIONS_DIR / name / "raw.log"),
+            "claude_session_id": meta.get("session_id"),
+            "claude_transcript": meta.get("claude_transcript"),
+            "claude_transcript_exists": bool(meta.get("claude_transcript"))
+                                        and os.path.exists(meta["claude_transcript"]),
+        }, ensure_ascii=False, indent=2))
+        return
+    if not opts.quiet:
+        sys.stdout.write("\n")
+    sys.stdout.write(RESULT_DELIM + "\n")
+    note = {
+        "timeout": "[timeout] sub-agent did not finish in time; partial output below:\n",
+        "crash": f"[crashed] claude exited unexpectedly (code={detail}); partial output below:\n",
+        "question": "[needs input] sub-agent stopped to ask:\n",
+    }.get(completion, "")
+    if note:
+        sys.stdout.write(note)
+    sys.stdout.write(answer + ("" if answer.endswith("\n") else "\n"))
+    sys.stdout.flush()
+
+
+def cmd_run(opts) -> int:
+    if not have_tmux():
+        print("tmuxa: tmux not found on PATH", file=sys.stderr)
+        return 6
+    ensure_dirs()
+    vlog = make_vlog(opts.verbose)
+    name = opts.name or unique_name()
+    if session_exists(name):
+        print(f"tmuxa: session '{name}' already exists (use --name)", file=sys.stderr)
+        return 2
+    prompt = read_prompt(opts)
+    if not prompt.strip():
+        print("tmuxa: empty prompt", file=sys.stderr)
+        return 2
+    # --system-prompt-file FILE → inline its contents as --append-system-prompt. The
+    # interactive TUI has no --system-prompt-file flag, so the file is *appended* to
+    # claude's default system prompt (an explicit --append-system-prompt still wins).
+    if getattr(opts, "system_prompt_file", None) and not opts.append_system_prompt:
+        try:
+            opts.append_system_prompt = pathlib.Path(
+                os.path.expanduser(opts.system_prompt_file)).read_text()
+        except OSError as e:
+            print(f"tmuxa: cannot read --system-prompt-file "
+                  f"{opts.system_prompt_file}: {e}", file=sys.stderr)
+            return 2
+    marker = make_marker() if opts.completion in ("hybrid", "sentinel") else None
+    full = prompt + (sentinel_instruction(marker) if marker else "")
+    cwd = os.path.abspath(os.path.expanduser(opts.cwd)) if opts.cwd else os.getcwd()
+    # Force a known Claude Code session id (generated if not supplied) so its native
+    # JSONL transcript lands at a DETERMINISTIC path the caller can read directly —
+    # see claude_transcript_path(). build_claude_cmd passes it as `claude --session-id`.
+    sid = getattr(opts, "session_id", None)
+    if sid:
+        try:
+            uuid.UUID(str(sid))
+        except ValueError:
+            print(f"tmuxa: --session-id must be a valid UUID: {sid!r}", file=sys.stderr)
+            return 2
+        sid = str(sid)
+    else:
+        sid = str(uuid.uuid4())
+    opts.session_id = sid
+    transcript = claude_transcript_path(cwd, sid)
+    opts.claude_transcript = str(transcript)   # stream_and_detect paces polling off its mtime
+    # Render/traffic knobs for the spawned claude TUI — its own frame redraw is the dominant
+    # CPU cost vs a headless `claude -p`, so trim everything non-essential:
+    #   DISABLE_ALTERNATE_SCREEN      classic main-screen renderer (no fullscreen repaint)
+    #   DISABLE_MOUSE                 no mouse-tracking churn
+    #   DISABLE_NONESSENTIAL_TRAFFIC  no autoupdater/telemetry/error-report/feedback traffic
+    #   DISABLE_TERMINAL_TITLE        no per-turn title escapes (also skips the Haiku title call)
+    env = {"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
+           "CLAUDE_CODE_DISABLE_MOUSE": "1",
+           "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+           "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"}
+    # forward the caller's Anthropic/Claude API config to the sub-agent, so a custom
+    # endpoint/token/model reaches it regardless of the shared tmux server's own env. This
+    # is the sole credential channel: the caller (e.g. pijs runner.py) feeds the token via
+    # ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL; with none set, claude uses its ~/.claude login.
+    for k, v in os.environ.items():
+        if (k.startswith("ANTHROPIC_") or k.startswith("CLAUDE_")) and k not in env:
+            env[k] = v
+    claude_cmd = build_claude_cmd(name, opts)
+
+    _STATE["name"], _STATE["keep"] = name, opts.keep
+    session_dir(name)
+    write_meta(name, {"name": name, "cwd": cwd, "started_at": time.time(),
+                      "prompt": prompt[:200], "completion": opts.completion,
+                      "account": None,
+                      "session_id": sid, "claude_transcript": str(transcript),
+                      "socket": SOCKET, "pid": os.getpid()})
+    log = str(SESSIONS_DIR / name / "raw.log")
+
+    spawn_ts = time.time()   # lower bound for the transcript's mtime (created after spawn)
+    try:
+        new_agent_session(name, cwd, claude_cmd, env)
+    except TmuxError as e:
+        print(f"tmuxa: failed to spawn session: {e}", file=sys.stderr)
+        return 6
+
+    try:
+        attach_pipe(name, log)
+        vlog(f"spawned '{name}' (cwd={cwd}, session_id={sid})")
+        vlog(f"native transcript -> {transcript}")
+        wait_until_ready(name, opts.ready_timeout, opts.poll_ms / 1000.0, vlog)
+        send_prompt(name, full, marker, opts.poll_ms / 1000.0, vlog)
+        # Stash what stream_and_detect needs to LAZILY locate the native transcript in its
+        # poll loop. The interactive TUI writes <sid>.jsonl with large, variable latency
+        # (seconds to >10s on claude 2.1.205), so we do NOT block on it here: the loop keeps
+        # the TUI FSM as a bridge and switches to the transcript the moment it appears (early
+        # relative to a long audit's runtime — where the version-fragile scrape is riskiest).
+        opts.claude_transcript = str(transcript)   # deterministic path (verified in-loop)
+        opts.resolve_cwd = cwd
+        opts.spawn_ts = spawn_ts
+        opts.prompt_needle = prompt.strip()[:80] or None
+        completion, detail, answer = stream_and_detect(name, marker, opts, vlog)
+        emit_result(name, completion, detail, answer, opts)
+        return exit_code_for(completion)
+    except ReadyTimeout:
+        print("tmuxa: claude TUI did not become ready in time", file=sys.stderr)
+        sys.stderr.write(capture(name) + "\n")
+        return 4
+    except ClaudeExited as e:
+        print(f"tmuxa: claude exited during startup (code={e.code})", file=sys.stderr)
+        sys.stderr.write(capture(name, history=True) + "\n")
+        return 5
+    finally:
+        if opts.keep:
+            print(f"[tmuxa] session kept: tmux -S {SOCKET} attach -t {name}", file=sys.stderr)
+        else:
+            kill_session(name)
+            _STATE["name"] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Management verbs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_list(argv) -> int:
+    p = argparse.ArgumentParser(prog="tmuxa list")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    # Read Claude's own self-reported status once (same source as tmux-claude-session-manager),
+    # keyed by session_id; fall back to a TUI scrape for any session it doesn't cover.
+    agents_status = agents_status_by_session(query_claude_agents())
+    rows = []
+    for n in sorted(list_session_names()):
+        meta = read_meta(n)
+        if session_exists(n):
+            st = agents_status.get(meta.get("session_id"))
+            if st == _AGENT_BUSY:
+                state = "working"
+            elif st == _AGENT_WAIT:
+                state = "waiting"
+            elif st == _AGENT_IDLE:
+                state = "idle"
+            else:
+                state = "working" if is_working(capture(n), n) else "idle"
+        else:
+            state = "dead"
+        started = meta.get("started_at")
+        elapsed = round(time.time() - started, 1) if started else None
+        rows.append({"session": n, "state": state, "elapsed_s": elapsed,
+                     "cwd": meta.get("cwd", "?"), "prompt": meta.get("prompt", "")})
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no tmuxa sessions)")
+        return 0
+    for r in rows:
+        el = f"{r['elapsed_s']}s" if r["elapsed_s"] is not None else "-"
+        print(f"{r['state']:8} {r['session']:20} {el:>8}  {r['cwd']}")
+    return 0
+
+
+def cmd_kill(argv) -> int:
+    p = argparse.ArgumentParser(prog="tmuxa kill")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--all", action="store_true")
+    a = p.parse_args(argv)
+    if a.all:
+        names = list_session_names()
+        for n in names:
+            kill_session(n)
+        print(f"killed {len(names)} session(s)")
+        return 0
+    if not a.name:
+        print("tmuxa kill: provide a session name or --all", file=sys.stderr)
+        return 2
+    if not session_exists(a.name):
+        print(f"tmuxa kill: no such session: {a.name}", file=sys.stderr)
+        return 2
+    kill_session(a.name)
+    print(f"killed {a.name}")
+    return 0
+
+
+def cmd_attach(argv) -> int:
+    p = argparse.ArgumentParser(prog="tmuxa attach")
+    p.add_argument("name")
+    p.add_argument("--exec", action="store_true",
+                   help="exec the attach command instead of printing it")
+    a = p.parse_args(argv)
+    if not session_exists(a.name):
+        print(f"tmuxa attach: no such session: {a.name}", file=sys.stderr)
+        return 2
+    cmd = ["tmux", "-S", SOCKET, "attach", "-t", a.name]
+    if a.exec:
+        os.execvp("tmux", cmd)
+    print(" ".join(shlex.quote(c) for c in cmd))
+    return 0
+
+
+def cmd_logs(argv) -> int:
+    p = argparse.ArgumentParser(prog="tmuxa logs")
+    p.add_argument("name")
+    p.add_argument("-n", type=int, default=0, help="show only the last N lines")
+    p.add_argument("--grep", help="show only lines matching this regex")
+    p.add_argument("--full", action="store_true", help="ignore -n; show everything")
+    a = p.parse_args(argv)
+    if session_exists(a.name):
+        lines = clean_capture(capture(a.name, history=True))
+    else:
+        tpath = SESSIONS_DIR / a.name / "transcript.txt"
+        rpath = SESSIONS_DIR / a.name / "raw.log"
+        if tpath.exists():
+            lines = tpath.read_text().split("\n")
+        elif rpath.exists():
+            text = rpath.read_bytes().decode("utf-8", "replace")
+            lines = [l for l in (apply_cr(strip_ansi(x)).rstrip()
+                                 for x in text.split("\n")) if l.strip()]
+        else:
+            print(f"tmuxa logs: no logs for: {a.name}", file=sys.stderr)
+            return 2
+    if a.grep:
+        rx = re.compile(a.grep)
+        lines = [l for l in lines if rx.search(l)]
+    if a.n and not a.full:
+        lines = lines[-a.n:]
+    print("\n".join(lines))
+    return 0
+
+
+def _gather_prompts(opts) -> list[str]:
+    prompts = list(opts.prompt or [])
+    if opts.prompts_file:
+        for line in pathlib.Path(os.path.expanduser(opts.prompts_file)).read_text().splitlines():
+            if line.strip():
+                prompts.append(line.rstrip("\n"))
+    return prompts
+
+
+def _build_slots(max_parallel: int | None) -> list[None]:
+    """N worker slots = the parallelism cap (default 3). Credentials come from the
+    ambient environment now (tmuxa no longer manages an account pool)."""
+    return [None] * max(1, max_parallel or 3)
+
+
+def cmd_batch(argv) -> int:
+    """Run many prompts in parallel; each spawns its own `tmuxa -p` using ambient creds."""
+    p = argparse.ArgumentParser(prog="tmuxa batch",
+                                description="Run many prompts in parallel (ambient credentials).")
+    p.add_argument("-p", "--prompt", action="append", help="a prompt (repeatable)")
+    p.add_argument("--prompts-file", help="file with one prompt per line ('-' = stdin)")
+    p.add_argument("--cwd")
+    p.add_argument("--timeout", type=float, default=DEFAULTS["timeout"])
+    p.add_argument("--max-parallel", type=int, default=3,
+                   help="cap total parallelism (default: 3)")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    if a.prompts_file == "-":
+        a.prompts_file = None
+        a.prompt = (a.prompt or []) + [l for l in sys.stdin.read().splitlines() if l.strip()]
+    prompts = _gather_prompts(a)
+    if not prompts:
+        print("tmuxa batch: no prompts (use -p ... or --prompts-file FILE)", file=sys.stderr)
+        return 2
+
+    slots = _build_slots(a.max_parallel)
+    results: list[dict | None] = [None] * len(prompts)
+    tasks: queue.Queue = queue.Queue()
+    for i, pr in enumerate(prompts):
+        tasks.put((i, pr))
+    lock = threading.Lock()
+    done = [0]
+
+    def worker():
+        while True:
+            try:
+                i, pr = tasks.get_nowait()
+            except queue.Empty:
+                return
+            cmd = [sys.executable, SELF, "-p", pr, "--json", "--quiet",
+                   "--timeout", str(a.timeout)]
+            if a.cwd:
+                cmd += ["--cwd", a.cwd]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            rec = {"prompt": pr, "exit_code": r.returncode}
+            try:
+                d = json.loads(r.stdout)
+                rec.update({k: d.get(k) for k in
+                            ("completion", "result", "session", "elapsed_s",
+                             "claude_session_id", "claude_transcript")})
+            except ValueError:
+                rec["result"] = (r.stdout or r.stderr).strip()[-600:]
+                rec["completion"] = "error"
+            results[i] = rec
+            with lock:
+                done[0] += 1
+                print(f"[tmuxa batch] {done[0]}/{len(prompts)} done — "
+                      f"#{i} ({rec.get('completion')})", file=sys.stderr)
+
+    print(f"[tmuxa batch] {len(prompts)} prompts · {len(slots)} parallel slots", file=sys.stderr)
+    workers = [threading.Thread(target=worker, daemon=True) for _ in slots]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+    if a.json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        for i, rec in enumerate(results):
+            rec = rec or {}
+            print(f"\n==== #{i} [{rec.get('completion')}] {rec.get('prompt', '')[:70]}")
+            print((rec.get("result") or "").strip()[:800])
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_run_args(argv):
+    p = argparse.ArgumentParser(
+        prog="tmuxa",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Spawn and drive a Claude Code sub-agent inside a tmux session.\n\n"
+            "Inspect sub-agents (running or finished):\n"
+            "  tmuxa list                 list sessions (state, elapsed, cwd, prompt)\n"
+            "  tmuxa logs <name>          dump a session's full pane (cleaned)\n"
+            "    tmuxa logs <name> --full     ignore -n; show everything\n"
+            "    tmuxa logs <name> -n N       only the last N lines\n"
+            "    tmuxa logs <name> --grep RE  only lines matching RE\n"),
+        epilog="verbs: tmuxa list | kill <name|--all> | attach <name> | logs <name>")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("-p", "--prompt", help="prompt to send to the agent ('-' reads stdin)")
+    g.add_argument("--prompt-file", help="read the prompt from a file")
+    p.add_argument("--name", help="session name (default: agent-<rand>); also the -n display name")
+    p.add_argument("--cwd", help="working directory for the agent (default: $PWD)")
+    p.add_argument("--model", help="pass through to claude --model")
+    p.add_argument("--session-id", dest="session_id",
+                   help="force `claude --session-id <uuid>` (default: a generated UUID) so the "
+                        "native transcript path is deterministic; reported in --json as "
+                        "claude_transcript / claude_transcript_exists")
+    p.add_argument("--append-system-prompt", dest="append_system_prompt",
+                   help="pass through to claude --append-system-prompt")
+    p.add_argument("--system-prompt-file", dest="system_prompt_file",
+                   help="read a system prompt from FILE and pass it via --append-system-prompt")
+    p.add_argument("--tools",
+                   help="pass through to claude --tools (allowed tools, e.g. 'Bash,Read')")
+    p.add_argument("--disallowed-tools", dest="disallowed_tools",
+                   help="pass through to claude --disallowedTools (e.g. 'Edit,Write,Task')")
+    p.add_argument("--effort", help="pass through to claude --effort (e.g. high|max)")
+    p.add_argument("--timeout", type=float, default=DEFAULTS["timeout"],
+                   help="wall-clock budget for the working phase (s)")
+    p.add_argument("--ready-timeout", type=float, default=DEFAULTS["ready_timeout"],
+                   help="startup budget for the TUI (s)")
+    p.add_argument("--idle-secs", type=float, default=DEFAULTS["idle_secs"],
+                   help="quiescence window for idle-completion (s)")
+    p.add_argument("--poll-ms", type=int, default=DEFAULTS["poll_ms"],
+                   help="poll interval (ms)")
+    p.add_argument("--agents-poll-ms", type=int, default=DEFAULTS["agents_poll_ms"],
+                   help="throttle for the `claude agents --json` status poll (ms); this is the "
+                        "primary completion signal (same method as tmux-claude-session-manager)")
+    p.add_argument("--no-agents-status", dest="agents_status", action="store_false",
+                   help="disable the claude-agents status signal; use only transcript/TUI detection")
+    p.add_argument("--completion", choices=["hybrid", "idle", "sentinel"], default="hybrid",
+                   help="done-detection strategy (default hybrid: sentinel + idle)")
+    p.add_argument("--on-question", choices=["return", "wait"], default="return",
+                   help="what to do if the agent stops to ask a question")
+    p.add_argument("--keep", action="store_true", help="don't kill the session at the end")
+    p.add_argument("--quiet", "-q", action="store_true", help="suppress live streaming")
+    p.add_argument("--json", action="store_true", help="emit a JSON result envelope")
+    p.add_argument("--full-transcript", action="store_true",
+                   help="return the whole response, not just the final answer")
+    p.add_argument("--verbose", "-v", action="store_true", help="log state to stderr")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    verbs = {"list": cmd_list, "kill": cmd_kill, "attach": cmd_attach,
+             "logs": cmd_logs, "batch": cmd_batch}
+    if argv and argv[0] in verbs:
+        return verbs[argv[0]](argv[1:])
+    try:
+        return cmd_run(parse_run_args(argv))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
