@@ -9,6 +9,9 @@
     "type": "command",
     "command": "bash ~/.claude/statusline.sh"
   },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
   "model": "claude-opus-5[1m]",
   "effortLevel": "xhigh",
   "prefersReducedMotion": true,
