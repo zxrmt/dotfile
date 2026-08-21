@@ -11,6 +11,11 @@
 #   CTRL-K  kill the selected session
 #   CTRL-O  open the full scrollback of the selected session in less
 #
+# Shortcuts around the picker: with no live sessions on the socket there's
+# nothing to browse, so the tool opens an interactive shell there instead
+# (session name: `shell`); with exactly one session it attaches straight to it.
+# TMUXA_ALWAYS_LIST=1 forces the fzf browser in that one-session case.
+#
 # The preview live-follows by default (re-captures once a second). Launch with
 # TMUXA_FOLLOW=0 for a single static snapshot instead.
 #
@@ -31,9 +36,34 @@ SOCKET="${TMUXA_SOCKET:-$CACHE/tmux.sock}"
 SESSIONS_DIR="$CACHE/sessions"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CLAUDE_SESSION="${TMUXA_CLAUDE_SESSION:-claude}"   # name of the interactive scratch session
-export SOCKET SESSIONS_DIR SELF CLAUDE_SESSION
+SHELL_SESSION="${TMUXA_SHELL_SESSION:-shell}"      # name of the fallback shell session
+export SOCKET SESSIONS_DIR SELF CLAUDE_SESSION SHELL_SESSION
 
 tm() { tmux -S "$SOCKET" "$@"; }
+
+# Is this script running inside a client attached to tmuxa's PRIVATE socket
+# (i.e. inside the popup this script opens)? A key binding's run-shell exports
+# TMUX="<socket>,<pid>,<session>", so compare the socket path — resolved too,
+# since the path tmux reports is whatever it was handed on the command line.
+inside_private() {
+    local cur="${TMUX%%,*}"
+    [ -n "$cur" ] || return 1
+    [ "$cur" = "$SOCKET" ] && return 0
+    [ "$(readlink -f "$cur" 2>/dev/null)" = "$(readlink -f "$SOCKET" 2>/dev/null)" ]
+}
+
+# Close the popup we're sitting in by detaching this client from the private
+# server. Target the client explicitly so a session attached from somewhere
+# else as well doesn't get dragged along.
+detach_self() {
+    local tty
+    tty="$(tmux display-message -p '#{client_tty}' 2>/dev/null || true)"
+    if [ -n "$tty" ]; then
+        tmux detach-client -t "$tty" 2>/dev/null || tmux detach-client 2>/dev/null || true
+    else
+        tmux detach-client 2>/dev/null || true
+    fi
+}
 
 list_sessions() {
     # name<TAB>status — status is a cheap glance (dead / working / idle) taken
@@ -93,6 +123,9 @@ dump() {  # full scrollback → stdout (for CTRL-O / less)
 # popup belongs to the user's session, while the browser inside it still talks
 # to tmuxa's private socket via tm().
 popup() {
+    # Pressed *inside* the popup (any session on the private socket): toggle it
+    # shut instead of stacking another tmux layer on top of itself.
+    if inside_private; then detach_self; exit 0; fi
     local w h
     w="$(tmux show-option -gqv @claude_popup_width)";  [ -n "$w" ] || w='90%'
     h="$(tmux show-option -gqv @claude_popup_height)"; [ -n "$h" ] || h='90%'
@@ -140,10 +173,31 @@ esac
 
 command -v fzf  >/dev/null || { echo "fzf not found" >&2; exit 1; }
 command -v tmux >/dev/null || { echo "tmux not found" >&2; exit 1; }
-tm has-session 2>/dev/null || tm list-sessions >/dev/null 2>&1 || {
-    echo "no tmuxa server at $SOCKET" >&2; exit 1; }
+# Nothing to browse: either no tmuxa server at all, or a server with zero live
+# sessions. Rather than erroring out (and blanking the popup), drop straight
+# into an interactive shell on the private socket. It becomes a normal session
+# there, so the next run of this browser lists it like any agent pane, and it
+# survives detach. `new-session -A` reattaches it if it's already around.
+names="$(tm list-sessions -F '#{session_name}' 2>/dev/null | sort || true)"
+count="$(printf '%s' "$names" | grep -c . || true)"
 
-sel="$(
+if [ "$count" -eq 0 ]; then
+    # tmuxa creates the cache dir when it starts its server; if it never ran on
+    # this box the dir doesn't exist yet and tmux would die with "error creating
+    # <socket>" (in a popup: an instant flash and gone).
+    mkdir -p "$(dirname "$SOCKET")"
+    [ -f "$HOME/.tmux.conf" ] && tm source-file "$HOME/.tmux.conf" 2>/dev/null || true
+    exec env -u TMUX tmux -S "$SOCKET" new-session -A -s "$SHELL_SESSION" -c "$PWD" \
+        "${SHELL:-/bin/bash}"
+fi
+
+if [ "$count" -eq 1 ] && [ "${TMUXA_ALWAYS_LIST:-0}" != "1" ]; then
+    # A picker with a single row is just an extra keypress — attach straight to
+    # it. TMUXA_ALWAYS_LIST=1 forces the browser (for C-k / C-o on that one
+    # session) even when it's the only one.
+    sel="$names"
+else
+    sel="$(
     list_sessions | fzf \
         --ansi --delimiter='\t' --with-nth='2,1' \
         --preview '"$SELF" --preview {1}' \
@@ -153,7 +207,8 @@ sel="$(
         --bind "ctrl-k:execute-silent(tmux -S \"$SOCKET\" kill-session -t {1})+reload(\"$SELF\" --list)" \
         --bind "ctrl-o:execute(\"$SELF\" --dump {1} | less -R)" \
     | cut -f1
-)"
+    )"
+fi
 
 [ -n "${sel:-}" ] || exit 0
 
