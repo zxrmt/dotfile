@@ -1415,7 +1415,11 @@ def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog):
     completion, detail = "timeout", None
     while time.time() < deadline:
         if not opts.quiet:
-            for line in [l for l in clean_frame_text(tail.read_new()) if not is_status_line(l)]:
+        # Drop blank padding: clean_frame_text('') == [''] (an empty/ANSI-only
+        # chunk), so emitting every item printed one blank line per poll while mini
+        # was waiting on the model -> the tall gap before '[step 1]'. Blank lines
+        # carry no info in the live echo (the final transcript already collapses them).
+            for line in [l for l in clean_frame_text(tail.read_new()) if l.strip() and not is_status_line(l)]:
                 sys.stdout.write(line + "\n")
             sys.stdout.flush()
         dead, code, _ = pane_status(name)
@@ -1425,7 +1429,7 @@ def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog):
             break
         time.sleep(poll)
     if not opts.quiet:                       # drain whatever the final frame added
-        for line in [l for l in clean_frame_text(tail.read_new()) if not is_status_line(l)]:
+        for line in [l for l in clean_frame_text(tail.read_new()) if l.strip() and not is_status_line(l)]:
             sys.stdout.write(line + "\n")
         sys.stdout.flush()
     full = capture(name, history=True)
