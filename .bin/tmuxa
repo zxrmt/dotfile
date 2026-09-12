@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
-"""tmuxa — spawn and drive a coding-agent sub-agent inside a tmux session.
+"""tmuxa — spawn and drive a Claude Code sub-agent inside a tmux session.
 
 Agent-like delegation: `tmuxa -p "<prompt>"` launches a fresh, visible,
 attachable `claude --dangerously-skip-permissions` session in its own tmux
 session, feeds it the prompt, streams the work to stdout, detects when the
 sub-agent has finished, and returns the final answer — so a parent Claude Code
 instance can consume it like the built-in Agent tool's result.
-
-Two harnesses. The default (`--harness claude`) drives Claude Code: it dismisses the
-startup prompts, pastes the prompt into the TUI, and reads completion + the final answer
-from Claude Code's native JSONL transcript. `--harness opencode` drives the opencode TUI
-instead: the prompt is delivered by `opencode --prompt` at spawn, and both completion and
-the answer come from opencode's own SQLite session store. Either way the answer a caller
-consumes is lossless — never a screen scrape.
 
 Single file, python3 stdlib only. See README.md for design notes.
 """
@@ -27,7 +20,6 @@ import re
 import shlex
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -713,7 +705,14 @@ SIG = {
     "question_widget": re.compile(r"Enter to select|↑/↓ to navigate"),
 }
 
-_STATUS_GLYPHS = set("·∙⋅•◦‣⁂✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀⭐")
+_STATUS_GLYPHS = set("●·∙⋅•◦‣⁂✢✣✤✥✦✧✩✪✫✬✭✮✯✰✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀⭐")
+# "●" (U+25CF) is BOTH the assistant bullet and, in current Claude Code, the working
+# spinner glyph ("● Flummoxing… (4s · thinking)"). It was absent from this set, so a
+# turn in flight read as not-working while ALSO matching SIG["assistant"], and the
+# detector completed on it after idle_secs and returned the spinner text as the answer.
+# Measured 2026-08-21 against an agent that had produced nothing: elapsed 5.5s,
+# completion "idle", result "Flummoxing… (4s · thinking)". Disambiguation is by shape
+# rather than by glyph: a spinner is glyph + gerund-ending-in-ellipsis, an answer is not.
 _STATUS_GLYPHS |= {chr(c) for c in range(0x2800, 0x2900)}  # braille spinner cells
 _BARE_GERUND = re.compile(r"^[A-Za-z][\w'’-]*…$")      # Warping…
 _TIMER_TAIL = re.compile(r"\bfor \d+s$")
@@ -724,6 +723,8 @@ def is_status_line(line: str) -> bool:
     s = line.strip()
     if not s:
         return False
+    if _is_spinner_line(s):     # "● Flummoxing…" is the spinner, not an answer bullet
+        return True
     if SIG["assistant"].match(s) or SIG["prompt_echo"].match(s):
         return False
     if s[0] in _STATUS_GLYPHS:
@@ -922,7 +923,8 @@ def split_frame(frame: str, name: str) -> tuple[list[str], bool]:
 
 def answer_from_response(resp: list[str], marker: str | None = None) -> str:
     """Extract the final assistant answer (last ● block) from response lines."""
-    bullets = [i for i, l in enumerate(resp) if SIG["assistant"].search(l)]
+    bullets = [i for i, l in enumerate(resp)
+               if SIG["assistant"].search(l) and not _is_spinner_line(l)]
     if bullets:
         start = bullets[-1]
         body = [re.sub(r"^●\s+", "", resp[start])]
@@ -1365,6 +1367,124 @@ def stream_and_detect(name: str, marker: str | None, opts, vlog):
     return completion, detail, answer
 
 
+def mini_bin() -> str:
+    """Absolute path to the mini-swe-agent CLI (robust against the tmux server's PATH)."""
+    return shutil.which("mini") or shutil.which("mini-swe-agent") or "mini"
+
+
+def build_mini_cmd(mini_path: str, opts, prompt: str, trajectory: str) -> str:
+    """tmux command line that runs ONE mini task to completion and exits.
+
+    `--yolo` skips per-action confirmation; `--exit-immediately` makes the REPL quit
+    the moment the agent submits (rather than looping for another task), so the pane
+    dying is an unambiguous, version-proof completion signal. `-o` pins the trajectory
+    to a path we read the final answer from (info.submission) -- the analogue of Claude
+    Code's native JSONL transcript for the claude backend."""
+    parts = ["exec", shlex.quote(mini_path), "--yolo", "--quiet", "--exit-immediately",
+             "-t", shlex.quote(prompt), "-o", shlex.quote(trajectory)]
+    if opts.model:
+        parts += ["-m", shlex.quote(opts.model)]
+    return " ".join(parts)
+
+
+def _read_mini_trajectory(path: str) -> tuple[str | None, str | None]:
+    """(submission, exit_status) from a mini trajectory JSON, or (None, None)."""
+    try:
+        info = (json.loads(pathlib.Path(path).read_text()) or {}).get("info") or {}
+    except (OSError, ValueError):
+        return None, None
+    submission = info.get("submission")
+    if isinstance(submission, list):
+        submission = "\n".join(str(x) for x in submission)
+    # Normalize like the claude backend (answer_from_response() ends in .strip()):
+    # mini stores the final message verbatim, which carries a trailing newline, so an
+    # unstripped submission leaks "\n" into the --json result and the text answer.
+    return (str(submission).strip() if submission is not None else None,
+            str(info["exit_status"]) if info.get("exit_status") is not None else None)
+
+
+def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog):
+    """Tail the pane until the mini process exits, then read its final answer.
+
+    Unlike the claude backend there is no TUI to screen-scrape: the task was handed to
+    mini on the command line, readiness is instant, and completion IS the process exit.
+    The authoritative answer comes from the trajectory's info.submission."""
+    poll = opts.poll_ms / 1000.0
+    tail = LogTail(log)
+    deadline = time.time() + opts.timeout
+    completion, detail = "timeout", None
+    while time.time() < deadline:
+        if not opts.quiet:
+            for line in [l for l in clean_frame_text(tail.read_new()) if not is_status_line(l)]:
+                sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        dead, code, _ = pane_status(name)
+        if dead:
+            vlog(f"completion=exit (mini process exited code={code})")
+            completion, detail = "done", code
+            break
+        time.sleep(poll)
+    if not opts.quiet:                       # drain whatever the final frame added
+        for line in [l for l in clean_frame_text(tail.read_new()) if not is_status_line(l)]:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    full = capture(name, history=True)
+    try:  # persist a cleaned transcript so `tmuxa logs` still works once the session dies
+        (SESSIONS_DIR / name / "transcript.txt").write_text("\n".join(clean_capture(full)))
+    except OSError:
+        pass
+    submission, exit_status = _read_mini_trajectory(trajectory)
+    if completion == "done" and exit_status and exit_status.lower() != "submitted":
+        completion, detail = "crash", exit_status   # exited, but did NOT submit
+    if opts.full_transcript and completion != "crash":
+        body = [l for l in clean_capture(full) if not is_status_line(l)]
+        return completion, detail, collapse_blanks("\n".join(body)).strip()
+    if submission is None or not submission.strip():
+        body = [l for l in clean_capture(full) if not is_status_line(l)]
+        submission = collapse_blanks("\n".join(body)).strip()
+    return completion, detail, submission
+
+
+def cmd_run_mini(opts, name: str, prompt: str, cwd: str, vlog) -> int:
+    """Drive one mini-swe-agent task inside a tmux session (the `--agent mini` backend)."""
+    mbin = mini_bin()
+    if not ((os.path.isabs(mbin) and os.path.exists(mbin)) or shutil.which(mbin)):
+        print("tmuxa: mini agent not found on PATH; install mini-swe-agent or use --agent claude",
+              file=sys.stderr)
+        return 6
+    traj = str(SESSIONS_DIR / name / "mini_traj.json")
+    mini_cmd = build_mini_cmd(mbin, opts, prompt, traj)
+    # mini reads its model/credentials from MSWEA_*/OPENAI_*/ANTHROPIC_* plus HOME; forward
+    # them so the pane does not depend on whatever env the shared tmux server happens to hold.
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith(("MSWEA_", "OPENAI_", "ANTHROPIC_"))
+           or k in ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE")}
+    _STATE["name"], _STATE["keep"] = name, opts.keep
+    session_dir(name)
+    write_meta(name, {"name": name, "cwd": cwd, "started_at": time.time(),
+                      "prompt": prompt[:200], "completion": opts.completion,
+                      "agent": "mini", "mini_trajectory": traj,
+                      "account": None, "socket": SOCKET, "pid": os.getpid()})
+    log = str(SESSIONS_DIR / name / "raw.log")
+    try:
+        new_agent_session(name, cwd, mini_cmd, env)
+    except TmuxError as e:
+        print(f"tmuxa: failed to spawn session: {e}", file=sys.stderr)
+        return 6
+    try:
+        attach_pipe(name, log)
+        vlog(f"spawned mini agent '{name}' (cwd={cwd}, trajectory={traj})")
+        completion, detail, answer = stream_and_detect_mini(name, opts, log, traj, vlog)
+        emit_result(name, completion, detail, answer, opts)
+        return exit_code_for(completion)
+    finally:
+        if opts.keep:
+            print(f"[tmuxa] session kept: tmux -S {SOCKET} attach -t {name}", file=sys.stderr)
+        else:
+            kill_session(name)
+            _STATE["name"] = None
+
+
 def exit_code_for(completion: str) -> int:
     return {"sentinel": 0, "idle": 0, "done": 0, "question": 0,
             "timeout": 3, "crash": 5}.get(completion, 0)
@@ -1380,481 +1500,29 @@ def emit_result(name, completion, detail, answer, opts) -> None:
             "needs_input": completion == "question",
             "exit_code": exit_code_for(completion),
             "session": name,
+            "agent": meta.get("agent") or getattr(opts, "agent", "claude"),
             "account": meta.get("account"),
             "elapsed_s": elapsed,
             "transcript_path": str(SESSIONS_DIR / name / "raw.log"),
-            "harness": meta.get("harness") or "claude",
-            # The harness's own session id: a claude UUID, or an opencode `ses_…` id.
-            "agent_session_id": meta.get("session_id"),
             "claude_session_id": meta.get("session_id"),
             "claude_transcript": meta.get("claude_transcript"),
             "claude_transcript_exists": bool(meta.get("claude_transcript"))
                                         and os.path.exists(meta["claude_transcript"]),
-            "opencode_db": meta.get("opencode_db"),
+            "mini_trajectory": meta.get("mini_trajectory"),
         }, ensure_ascii=False, indent=2))
         return
     if not opts.quiet:
         sys.stdout.write("\n")
     sys.stdout.write(RESULT_DELIM + "\n")
-    harness = meta.get("harness") or "claude"
     note = {
         "timeout": "[timeout] sub-agent did not finish in time; partial output below:\n",
-        "crash": f"[crashed] {harness} exited unexpectedly (code={detail}); partial output "
-                 f"below:\n",
+        "crash": f"[crashed] sub-agent exited with an error (code={detail}); partial output below:\n",
         "question": "[needs input] sub-agent stopped to ask:\n",
     }.get(completion, "")
     if note:
         sys.stdout.write(note)
     sys.stdout.write(answer + ("" if answer.endswith("\n") else "\n"))
     sys.stdout.flush()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# opencode harness — `--harness opencode`
-#
-# tmuxa's default harness is Claude Code. `--harness opencode` swaps the spawned binary
-# for `opencode` (its interactive TUI, NOT `opencode run`) and swaps every Claude-specific
-# signal for opencode's own equivalent:
-#
-#   prompt delivery  `opencode --prompt <text>` submits at startup, so there is no
-#                    readiness probe, no bracketed paste and no Enter keystroke — the
-#                    three most version-fragile steps of the Claude path simply vanish.
-#                    The cost is that the prompt rides argv (see OPENCODE_PROMPT_ARGV_MAX).
-#   completion       opencode persists every message/part to a SQLite store (WAL). A turn
-#                    is settled when the newest assistant message has `time.completed` AND
-#                    its `finish` is not "tool-calls" — the value it carries between the
-#                    steps of a tool loop. This is the exact analogue of the Claude
-#                    transcript's stop_reason, and just as version-proof.
-#   final answer     the last `text` part of that message — lossless, so a narrow pane
-#                    can never wrap-mangle it (the failure mode the Claude path also
-#                    solves by reading the native transcript instead of the scrape).
-#   tool policy      opencode has NO --tools flag; its toolset is config-only, through
-#                    OPENCODE_CONFIG_CONTENT. A caller that already exported that owns the
-#                    policy verbatim; otherwise --tools/--disallowed-tools are translated
-#                    here into the same `tools` + `permission` pair.
-#
-# The store is shared by every opencode process on the machine, so our session is matched
-# by IDENTITY, never by recency alone: directory == our cwd, created at/after spawn, AND
-# its first user text part starts with our prompt. That is the same rule find_transcript_once
-# applies on the Claude side, and it is what keeps parallel agents in one repo from
-# cross-wiring into each other's answers.
-# ─────────────────────────────────────────────────────────────────────────────
-
-OPENCODE_BIN = (os.environ.get("OPENCODE_BIN")
-                or shutil.which("opencode")
-                or str(pathlib.Path.home() / ".opencode" / "bin" / "opencode"))
-
-# The opencode TUI has no --prompt-file: the prompt is one argv element, and Linux caps a
-# single argument at MAX_ARG_STRLEN (32 pages = 128 KB). Refuse a prompt that would make
-# execve fail with E2BIG rather than let tmux report an opaque spawn failure.
-OPENCODE_PROMPT_ARGV_MAX = 96_000
-
-# claude tool name -> opencode tool id. Mirrors runner.OPENCODE_TOOL_NAMES so a --tools CSV
-# written for the claude harness means the same thing here.
-OPENCODE_TOOL_NAMES = {"bash": "bash", "read": "read", "grep": "grep", "glob": "glob",
-                       "edit": "edit", "multiedit": "edit", "write": "write",
-                       "webfetch": "webfetch", "websearch": "websearch", "task": "task",
-                       "todowrite": "todowrite", "notebookedit": "edit"}
-
-# opencode's own built-in tool ids. Enumerated in full so a tool named by NEITHER half of
-# a --tools/--disallowed-tools pair still gets switched OFF: an allow list is a whitelist.
-OPENCODE_ALL_TOOLS = ("bash", "read", "edit", "write", "glob", "grep", "webfetch",
-                      "task", "todowrite", "websearch", "lsp", "skill", "patch",
-                      "question")
-
-# `finish` values that mean "another step of the same turn follows" — NOT a settled turn.
-_OC_WORKING_FINISH = {"tool-calls"}
-
-
-def opencode_data_dir() -> pathlib.Path:
-    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
-        os.path.expanduser("~"), ".local", "share")
-    return pathlib.Path(base) / "opencode"
-
-
-def opencode_db_path() -> pathlib.Path | None:
-    """Path of opencode's SQLite store, or None when it has none to read (:memory:).
-
-    Resolution order taken from the binary: $OPENCODE_DB wins (absolute, or relative to
-    the data dir); otherwise `opencode.db`, except on a non-release channel where the file
-    is `opencode-<channel>.db` — so fall back to the newest such sibling if the plain name
-    is absent."""
-    env = os.environ.get("OPENCODE_DB")
-    if env:
-        if env == ":memory:":
-            return None
-        p = pathlib.Path(os.path.expanduser(env))
-        return p if p.is_absolute() else opencode_data_dir() / env
-    d = opencode_data_dir()
-    if (d / "opencode.db").exists():
-        return d / "opencode.db"
-    try:
-        sibs = sorted(d.glob("opencode-*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        sibs = []
-    return sibs[0] if sibs else d / "opencode.db"
-
-
-def _csv_set(value: str | None) -> set[str]:
-    return {t.strip().lower() for t in (value or "").split(",") if t.strip()}
-
-
-def opencode_config_content(opts) -> str | None:
-    """The OPENCODE_CONFIG_CONTENT payload for the spawned pane, or None if there is
-    nothing to say.
-
-    A caller that already exported OPENCODE_CONFIG_CONTENT owns the tool policy and we do
-    NOT second-guess it — we only merge in the reasoning `variant`, which has no CLI flag
-    on the TUI (`opencode run --variant` exists; the TUI's config key does not). With no
-    inherited config, --tools/--disallowed-tools are translated into the redundant pair
-    opencode consults: `tools` gates which tools exist, `permission` gates whether a call
-    needs approval. No --auto is passed, so anything left at "ask" is auto-REJECTED."""
-    base: dict = {}
-    inherited = os.environ.get("OPENCODE_CONFIG_CONTENT")
-    if inherited:
-        try:
-            loaded = json.loads(inherited)
-        except ValueError:
-            loaded = None
-        if isinstance(loaded, dict):
-            base = loaded
-    if "tools" not in base:
-        allow = _csv_set(getattr(opts, "tools", None))
-        deny = _csv_set(getattr(opts, "disallowed_tools", None))
-        if allow:
-            allowed = {OPENCODE_TOOL_NAMES[t] for t in allow if t in OPENCODE_TOOL_NAMES}
-            # "*" is a real wildcard permission action (later rules win), so a tool id this
-            # file has never heard of is denied rather than inherited from opencode's
-            # default `* allow`.
-            tools = {"*": False}
-            tools.update({name: (name in allowed) for name in OPENCODE_ALL_TOOLS})
-            base["tools"] = tools
-            base["permission"] = {k: ("allow" if v else "deny") for k, v in tools.items()}
-        elif deny:
-            denied = {OPENCODE_TOOL_NAMES[t] for t in deny if t in OPENCODE_TOOL_NAMES}
-            base["tools"] = {name: False for name in sorted(denied)}
-            base["permission"] = {name: "deny" for name in sorted(denied)}
-    if getattr(opts, "effort", None):
-        base.setdefault("variant", opts.effort)   # resolves to agent.<name>.variant
-    return json.dumps(base) if base else None
-
-
-def build_opencode_cmd(opts, prompt: str) -> str:
-    """The shell command tmux `exec`s in the pane. The prompt is a single quoted argv
-    element; --model/--agent are the only other knobs the TUI takes (effort and the tool
-    policy both travel via OPENCODE_CONFIG_CONTENT). --auto is deliberately NOT passed:
-    permissions default to auto-reject, so a tool the config forgot stays unreachable."""
-    parts = ["exec", shlex.quote(OPENCODE_BIN), "--prompt", shlex.quote(prompt)]
-    if opts.model:
-        parts += ["--model", shlex.quote(opts.model)]
-    if getattr(opts, "opencode_agent", None):
-        parts += ["--agent", shlex.quote(opts.opencode_agent)]
-    return " ".join(parts)
-
-
-def _opencode_part_line(part: dict) -> str:
-    """One live-ticker line for a newly-seen part. Assistant activity is prefixed with the
-    same '●' bullet the Claude scrape emits, so a parent that counts bullets as turns (pijs
-    runner.py) keeps working across both harnesses."""
-    t = part.get("type")
-    if t == "tool":
-        state = part.get("state") or {}
-        inp = state.get("input") or {}
-        arg = ""
-        if isinstance(inp, dict):
-            for k in ("filePath", "command", "pattern", "path", "query", "url"):
-                if inp.get(k):
-                    arg = str(inp[k])
-                    break
-        arg = " ".join(arg.split())[:80]
-        return f"● {part.get('tool', 'tool')}" + (f" {arg}" if arg else "")
-    if t == "text":
-        lines = (part.get("text") or "").strip().splitlines()
-        return f"● {lines[0][:90]}" if lines else ""
-    if t == "reasoning":
-        lines = (part.get("text") or "").strip().splitlines()
-        return f"  … {lines[0][:90]}" if lines else ""
-    return ""
-
-
-class OpencodeDetector:
-    """Poll opencode's SQLite store for ONE session: completion verdict, final answer, and
-    the live part stream. Read-only, WAL-friendly (every SELECT runs in autocommit, so each
-    poll sees the newest committed snapshot without ever blocking the writer)."""
-
-    def __init__(self, db_path, cwd: str, needle: str, since_ms: int):
-        self.db_path = str(db_path) if db_path else None
-        # opencode stamps session.directory with the cwd it RESOLVED, so a pane started in a
-        # symlinked path is filed under the link TARGET. Match on both spellings: keying on
-        # the un-resolved path alone silently finds nothing, and "nothing" is indistinguishable
-        # from "still working" — the run would burn its whole --timeout and report a timeout
-        # for an agent that answered correctly minutes earlier.
-        self.dirs = sorted({cwd.rstrip("/") or "/",
-                            os.path.realpath(cwd).rstrip("/") or "/"})
-        self.needle = needle
-        self.since_ms = int(since_ms)
-        self.session_id: str | None = None
-        self._conn: "sqlite3.Connection | None" = None
-        self._failed = False
-        self._seen: set[str] = set()
-        self._user_msgs: set[str] = set()
-
-    # ── plumbing ────────────────────────────────────────────────────────────
-    def _connect(self):
-        if self._conn is not None or self._failed:
-            return self._conn
-        if not self.db_path or not os.path.exists(self.db_path):
-            return None
-        try:
-            self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True,
-                                         timeout=5.0, check_same_thread=False)
-            self._conn.execute("PRAGMA busy_timeout = 5000")
-        except sqlite3.Error:
-            self._conn, self._failed = None, True
-        return self._conn
-
-    def _rows(self, sql: str, params: tuple) -> list:
-        conn = self._connect()
-        if conn is None:
-            return []
-        try:
-            return conn.execute(sql, params).fetchall()
-        except sqlite3.Error:
-            return []
-
-    @staticmethod
-    def _json(blob) -> dict:
-        try:
-            o = json.loads(blob)
-        except (ValueError, TypeError):
-            return {}
-        return o if isinstance(o, dict) else {}
-
-    # ── identity ────────────────────────────────────────────────────────────
-    def _first_user_text(self, sid: str) -> str:
-        for mid, data in self._rows(
-                "SELECT id, data FROM message WHERE session_id = ? "
-                "ORDER BY time_created LIMIT 4", (sid,)):
-            if self._json(data).get("role") != "user":
-                continue
-            for (pdata,) in self._rows(
-                    "SELECT data FROM part WHERE message_id = ? ORDER BY time_created",
-                    (mid,)):
-                p = self._json(pdata)
-                if p.get("type") == "text" and isinstance(p.get("text"), str):
-                    return p["text"]
-        return ""
-
-    def find_session(self) -> str | None:
-        if self.session_id:
-            return self.session_id
-        placeholders = ",".join("?" * len(self.dirs))
-        for (sid,) in self._rows(
-                f"SELECT id FROM session WHERE directory IN ({placeholders}) "
-                f"AND time_created >= ? ORDER BY time_created DESC LIMIT 40",
-                (*self.dirs, self.since_ms)):
-            if self.needle and self._first_user_text(sid).strip().startswith(self.needle):
-                self.session_id = sid
-                return sid
-        return None
-
-    def _messages(self) -> list[tuple[str, dict]]:
-        if not self.session_id:
-            return []
-        out = []
-        for mid, data in self._rows(
-                "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created",
-                (self.session_id,)):
-            d = self._json(data)
-            if d.get("role") == "user":
-                self._user_msgs.add(mid)
-            out.append((mid, d))
-        return out
-
-    # ── signals ─────────────────────────────────────────────────────────────
-    def verdict(self) -> str | None:
-        """'done' | None (still working) | 'nodb' (store unreadable — no signal at all)."""
-        if self._connect() is None:
-            return "nodb"
-        if not self.find_session():
-            return None
-        assistants = [(mid, d) for mid, d in self._messages() if d.get("role") == "assistant"]
-        if not assistants:
-            return None
-        _mid, last = assistants[-1]
-        if not (last.get("time") or {}).get("completed"):
-            return None                       # a step is still streaming
-        if last.get("finish") in _OC_WORKING_FINISH:
-            return None                       # tool loop: the next step follows
-        return "done"
-
-    def new_events(self) -> list[str]:
-        """Ticker lines for assistant parts first seen since the last call."""
-        if not self.session_id:
-            return []
-        self._messages()                      # refresh the user-message id set
-        out = []
-        for pid, mid, data in self._rows(
-                "SELECT id, message_id, data FROM part WHERE session_id = ? "
-                "ORDER BY time_created", (self.session_id,)):
-            if pid in self._seen:
-                continue
-            self._seen.add(pid)
-            if mid in self._user_msgs:        # our own prompt echoed back — not activity
-                continue
-            line = _opencode_part_line(self._json(data))
-            if line:
-                out.append(line)
-        return out
-
-    def answer(self) -> str:
-        """The newest assistant message that actually produced text. Walking backwards
-        (rather than reading only the very last message) also yields the partial answer
-        when a run is cut short by --timeout or a crash."""
-        for mid, d in reversed(self._messages()):
-            if d.get("role") != "assistant":
-                continue
-            texts = []
-            for (pdata,) in self._rows(
-                    "SELECT data FROM part WHERE message_id = ? ORDER BY time_created",
-                    (mid,)):
-                p = self._json(pdata)
-                if p.get("type") == "text" and isinstance(p.get("text"), str) \
-                        and p["text"].strip():
-                    texts.append(p["text"])
-            if texts:
-                return "\n".join(texts).strip()
-        return ""
-
-
-def stream_and_detect_opencode(name: str, opts, cwd: str, prompt: str,
-                               db, spawn_ms: int, vlog):
-    """The opencode analogue of stream_and_detect. Completion comes from the store only —
-    there is no TUI-scrape fallback on this harness, by design: a scrape that silently
-    substitutes a wrapped, mangled pane for the real answer is the exact failure this
-    harness was written to avoid, so an unreadable store is reported, not papered over."""
-    # The needle is the WHOLE prompt, not a prefix: a benchmark fan-out gives every card the
-    # same multi-KB system prompt, so a short head matches any sibling agent in the same repo
-    # and two concurrent runs would read each other's answer.
-    det = OpencodeDetector(db, cwd, prompt.strip(), spawn_ms)
-    poll = opts.poll_ms / 1000.0
-    backoff_cap = max(poll, min(1.2, opts.idle_secs * 0.5))
-    cur = poll
-    deadline = time.time() + opts.timeout
-    completion, detail = "timeout", None
-    located = False
-    # opencode writes its session row within a second of accepting --prompt, so failing to
-    # find it is a wiring fault (wrong store, wrong directory spelling), not slow work. Give
-    # up quickly and say so: an unlocated session looks exactly like "still working", and
-    # --timeout here is hours long, so without this guard a config typo costs a whole run.
-    locate_deadline = time.time() + max(60.0, min(opts.ready_timeout * 6, 180.0))
-    while time.time() < deadline:
-        dead, code, _ = pane_status(name)
-        if dead:
-            completion, detail = "crash", code
-            vlog("completion=crash")
-            break
-        v = det.verdict()
-        if v == "nodb":
-            return "nostore", None, ""
-        if det.session_id and not located:
-            located = True
-            vlog(f"opencode session located: {det.session_id}")
-        if not located and time.time() > locate_deadline:
-            return "nosession", None, ""
-        events = det.new_events()
-        if events and not opts.quiet:
-            for line in events:
-                sys.stdout.write(line + "\n")
-            sys.stdout.flush()
-        if v == "done":
-            completion, detail = "done", None
-            vlog("completion=done (opencode message settled)")
-            break
-        cur = poll if events else min(backoff_cap, cur * 1.5)
-        time.sleep(cur)
-
-    for line in det.new_events():             # drain anything that landed on the last tick
-        if not opts.quiet:
-            sys.stdout.write(line + "\n")
-    if not opts.quiet:
-        sys.stdout.flush()
-    if det.session_id:
-        meta = read_meta(name)
-        meta["session_id"] = det.session_id
-        write_meta(name, meta)
-    try:  # persist a readable pane dump so `tmuxa logs` still works after the session dies
-        (SESSIONS_DIR / name / "transcript.txt").write_text(
-            "\n".join(clean_capture(capture(name, history=True))))
-    except (OSError, TmuxError):
-        pass
-    return completion, detail, det.answer()
-
-
-def cmd_run_opencode(opts, name: str, prompt: str, cwd: str, vlog) -> int:
-    """cmd_run's body for --harness opencode. Same lifecycle (spawn → stream → result →
-    kill), with the readiness/paste/Enter dance replaced by `--prompt` on argv."""
-    nbytes = len(prompt.encode("utf-8"))
-    if nbytes > OPENCODE_PROMPT_ARGV_MAX:
-        print(f"tmuxa: prompt is {nbytes} bytes — the opencode TUI takes it on argv (it has "
-              f"no --prompt-file) and Linux caps one argument at ~128 KB. Shorten the "
-              f"prompt or drive `opencode run` headless instead.", file=sys.stderr)
-        return 2
-    db = opencode_db_path()
-    env = {}
-    cfg = opencode_config_content(opts)
-    if cfg:
-        env["OPENCODE_CONFIG_CONTENT"] = cfg
-    # Forward the caller's opencode config (and PATH, for the tools opencode shells out to):
-    # the shared tmux server may long predate this process and carry a stale environment.
-    for k, v in os.environ.items():
-        if k.startswith("OPENCODE_") and k not in env:
-            env[k] = v
-    if os.environ.get("PATH"):
-        env.setdefault("PATH", os.environ["PATH"])
-    cmd = build_opencode_cmd(opts, prompt)
-    # The store stamps time_created from opencode's own clock; back-date the lower bound a
-    # little so a sub-second skew cannot hide our session from the identity scan.
-    spawn_ms = int(time.time() * 1000) - 5000
-
-    _STATE["name"], _STATE["keep"] = name, opts.keep
-    session_dir(name)
-    write_meta(name, {"name": name, "cwd": cwd, "started_at": time.time(),
-                      "prompt": prompt[:200], "completion": "store",
-                      "harness": "opencode", "account": None,
-                      "session_id": None, "opencode_db": str(db) if db else None,
-                      "socket": SOCKET, "pid": os.getpid()})
-    try:
-        new_agent_session(name, cwd, cmd, env)
-    except TmuxError as e:
-        print(f"tmuxa: failed to spawn session: {e}", file=sys.stderr)
-        return 6
-    try:
-        attach_pipe(name, str(SESSIONS_DIR / name / "raw.log"))
-        vlog(f"spawned '{name}' (harness=opencode, cwd={cwd}, bin={OPENCODE_BIN})")
-        vlog(f"opencode store -> {db}")
-        completion, detail, answer = stream_and_detect_opencode(
-            name, opts, cwd, prompt, db, spawn_ms, vlog)
-        if completion == "nostore":
-            print(f"tmuxa: opencode's session store is unreadable ({db}); there is no other "
-                  f"lossless source for the answer on this harness, so refusing to guess "
-                  f"from the TUI scrape.", file=sys.stderr)
-            sys.stderr.write(capture(name, history=True) + "\n")
-            return 6
-        if completion == "nosession":
-            print(f"tmuxa: no opencode session for this prompt appeared in {db} under "
-                  f"{cwd} — the pane is running but nothing it writes can be attributed to "
-                  f"this agent, so there is no answer to return.", file=sys.stderr)
-            sys.stderr.write(capture(name, history=True) + "\n")
-            return 6
-        emit_result(name, completion, detail, answer, opts)
-        return exit_code_for(completion)
-    finally:
-        if opts.keep:
-            print(f"[tmuxa] session kept: tmux -S {SOCKET} attach -t {name}", file=sys.stderr)
-        else:
-            kill_session(name)
-            _STATE["name"] = None
 
 
 def cmd_run(opts) -> int:
@@ -1882,18 +1550,11 @@ def cmd_run(opts) -> int:
             print(f"tmuxa: cannot read --system-prompt-file "
                   f"{opts.system_prompt_file}: {e}", file=sys.stderr)
             return 2
-    cwd = os.path.abspath(os.path.expanduser(opts.cwd)) if opts.cwd else os.getcwd()
-    if getattr(opts, "harness", "claude") == "opencode":
-        # The opencode TUI has no --append-system-prompt, so the system prompt is inlined
-        # AHEAD of the task prompt — exactly what the headless `opencode run` path does, so
-        # both transports feed the model byte-identical text.
-        if opts.append_system_prompt:
-            prompt = opts.append_system_prompt.rstrip("\n") + "\n\n" + prompt
-        # No sentinel marker on this harness: the store's own finish signal is authoritative,
-        # so nothing is appended to the prompt and the answer stays clean for strict parsers.
-        return cmd_run_opencode(opts, name, prompt, cwd, vlog)
     marker = make_marker() if opts.completion in ("hybrid", "sentinel") else None
     full = prompt + (sentinel_instruction(marker) if marker else "")
+    cwd = os.path.abspath(os.path.expanduser(opts.cwd)) if opts.cwd else os.getcwd()
+    if getattr(opts, "agent", "claude") == "mini":
+        return cmd_run_mini(opts, name, prompt, cwd, vlog)
     # Force a known Claude Code session id (generated if not supplied) so its native
     # JSONL transcript lands at a DETERMINISTIC path the caller can read directly —
     # see claude_transcript_path(). build_claude_cmd passes it as `claude --session-id`.
@@ -1994,23 +1655,19 @@ def cmd_list(argv) -> int:
     for n in sorted(list_session_names()):
         meta = read_meta(n)
         if session_exists(n):
-            if (meta.get("harness") or "claude") != "claude":
-                # Non-claude harnesses have no `claude agents --json` record and their TUI
-                # is not what is_working() was pinned against; report liveness only.
-                rows.append({"session": n, "state": "running",
-                             "elapsed_s": round(time.time() - meta["started_at"], 1)
-                                          if meta.get("started_at") else None,
-                             "cwd": meta.get("cwd", "?"), "prompt": meta.get("prompt", "")})
-                continue
-            st = agents_status.get(meta.get("session_id"))
-            if st == _AGENT_BUSY:
-                state = "working"
-            elif st == _AGENT_WAIT:
-                state = "waiting"
-            elif st == _AGENT_IDLE:
-                state = "idle"
+            if meta.get("agent") == "mini":
+                dead, _, _ = pane_status(n)
+                state = "working" if not dead else "dead"
             else:
-                state = "working" if is_working(capture(n), n) else "idle"
+                st = agents_status.get(meta.get("session_id"))
+                if st == _AGENT_BUSY:
+                    state = "working"
+                elif st == _AGENT_WAIT:
+                    state = "waiting"
+                elif st == _AGENT_IDLE:
+                    state = "idle"
+                else:
+                    state = "working" if is_working(capture(n), n) else "idle"
         else:
             state = "dead"
         started = meta.get("started_at")
@@ -2122,9 +1779,6 @@ def cmd_batch(argv) -> int:
     p.add_argument("--timeout", type=float, default=DEFAULTS["timeout"])
     p.add_argument("--max-parallel", type=int, default=3,
                    help="cap total parallelism (default: 3)")
-    p.add_argument("--harness", choices=["claude", "opencode"], default="claude",
-                   help="which agent CLI to drive (default: claude)")
-    p.add_argument("--model", help="model for every agent in the batch")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     if a.prompts_file == "-":
@@ -2150,11 +1804,9 @@ def cmd_batch(argv) -> int:
             except queue.Empty:
                 return
             cmd = [sys.executable, SELF, "-p", pr, "--json", "--quiet",
-                   "--timeout", str(a.timeout), "--harness", a.harness]
+                   "--timeout", str(a.timeout)]
             if a.cwd:
                 cmd += ["--cwd", a.cwd]
-            if a.model:
-                cmd += ["--model", a.model]
             r = subprocess.run(cmd, capture_output=True, text=True)
             rec = {"prompt": pr, "exit_code": r.returncode}
             try:
@@ -2197,8 +1849,9 @@ def parse_run_args(argv):
         prog="tmuxa",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Spawn and drive a coding-agent sub-agent inside a tmux session.\n"
-            "Harnesses: --harness claude (default) | --harness opencode.\n\n"
+            "Spawn and drive a sub-agent inside a tmux session.\n\n"
+            "  --agent claude   drive the Claude Code TUI (default)\n"
+            "  --agent mini     drive the mini-swe-agent CLI to completion\n\n"
             "Inspect sub-agents (running or finished):\n"
             "  tmuxa list                 list sessions (state, elapsed, cwd, prompt)\n"
             "  tmuxa logs <name>          dump a session's full pane (cleaned)\n"
@@ -2210,16 +1863,8 @@ def parse_run_args(argv):
     g.add_argument("-p", "--prompt", help="prompt to send to the agent ('-' reads stdin)")
     g.add_argument("--prompt-file", help="read the prompt from a file")
     p.add_argument("--name", help="session name (default: agent-<rand>); also the -n display name")
-    p.add_argument("--harness", choices=["claude", "opencode"], default="claude",
-                   help="which agent CLI to drive in the pane (default: claude). "
-                        "'opencode' spawns the opencode TUI with --prompt and reads "
-                        "completion + the final answer from opencode's own SQLite session "
-                        "store; --session-id/--completion/--agents-poll-ms are claude-only "
-                        "and ignored there")
-    p.add_argument("--opencode-agent", dest="opencode_agent",
-                   help="pass through to opencode --agent (default: opencode's own default)")
     p.add_argument("--cwd", help="working directory for the agent (default: $PWD)")
-    p.add_argument("--model", help="model for the agent (claude --model / opencode --model)")
+    p.add_argument("--model", help="pass through to claude --model")
     p.add_argument("--session-id", dest="session_id",
                    help="force `claude --session-id <uuid>` (default: a generated UUID) so the "
                         "native transcript path is deterministic; reported in --json as "
@@ -2229,10 +1874,10 @@ def parse_run_args(argv):
     p.add_argument("--system-prompt-file", dest="system_prompt_file",
                    help="read a system prompt from FILE and pass it via --append-system-prompt")
     p.add_argument("--tools",
-                   help="allowed tools, e.g. 'Bash,Read' (claude --tools; translated into opencode's tools/permission config, which is its only tool-policy channel)")
+                   help="pass through to claude --tools (allowed tools, e.g. 'Bash,Read')")
     p.add_argument("--disallowed-tools", dest="disallowed_tools",
-                   help="denied tools, e.g. 'Edit,Write,Task' (claude --disallowedTools; folded into opencode's tools/permission config)")
-    p.add_argument("--effort", help="reasoning effort (claude --effort; opencode config `variant`), e.g. high|max")
+                   help="pass through to claude --disallowedTools (e.g. 'Edit,Write,Task')")
+    p.add_argument("--effort", help="pass through to claude --effort (e.g. high|max)")
     p.add_argument("--timeout", type=float, default=DEFAULTS["timeout"],
                    help="wall-clock budget for the working phase (s)")
     p.add_argument("--ready-timeout", type=float, default=DEFAULTS["ready_timeout"],
@@ -2248,6 +1893,9 @@ def parse_run_args(argv):
                    help="disable the claude-agents status signal; use only transcript/TUI detection")
     p.add_argument("--completion", choices=["hybrid", "idle", "sentinel"], default="hybrid",
                    help="done-detection strategy (default hybrid: sentinel + idle)")
+    p.add_argument("--agent", choices=["claude", "mini"], default="claude",
+                   help="which sub-agent to spawn: 'claude' (Claude Code TUI) or "
+                        "'mini' (mini-swe-agent CLI, driven headlessly to completion)")
     p.add_argument("--on-question", choices=["return", "wait"], default="return",
                    help="what to do if the agent stops to ask a question")
     p.add_argument("--keep", action="store_true", help="don't kill the session at the end")
@@ -2275,3 +1923,6 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
