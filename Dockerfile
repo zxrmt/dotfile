@@ -1,6 +1,4 @@
-FROM ubuntu:25.10
-
-
+FROM ubuntu:24.04
 
 RUN apt update -y && \
     apt install -y curl gnupg && \
@@ -8,7 +6,7 @@ RUN apt update -y && \
     apt install -y nodejs
 
 RUN apt update -y
-RUN apt install -y git gzip unzip make cmake ripgrep fzf tmux python3-venv bat lazygit build-essential curl wget xxd file fd-find jq
+RUN apt install -y git gzip unzip make cmake ripgrep fzf tmux python3-venv bat build-essential curl wget xxd file fd-find jq
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 100
 
 RUN curl -L https://foundry.paradigm.xyz | bash
@@ -26,6 +24,9 @@ RUN apt update && apt install -y sudo \
  && usermod -aG sudo zx \
  && echo "zx ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/zx \
  && chmod 0440 /etc/sudoers.d/zx
+# default `sudo` to classic sudo.ws: sudo-rs needs close_range (kernel >=5.9),
+# this host kernel is 5.4 and docker seccomp returns EPERM for it
+# && update-alternatives --set sudo /usr/bin/sudo.ws
 
 # Rust lsp for vim
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
@@ -40,17 +41,15 @@ RUN git clone https://github.com/neovim/neovim --depth=1
 WORKDIR neovim
 RUN make CMAKE_BUILD_TYPE=RelWithDebInfo
 
-
 # Replace unstable Rust coreutils with GNU coreutils: fix the crash on cmp
-RUN apt-get update && \
-    apt-get remove -y --allow-remove-essential rust-coreutils coreutils-from-uutils && \
-    apt-get autoremove -y && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN sudo apt-get update && \
+    sudo apt-get remove -y --allow-remove-essential rust-coreutils && \
+    sudo apt-get autoremove -y && \
+    sudo  apt-get clean && \
+    sudo rm -rf /var/lib/apt/lists/*
 
 
-USER root
-RUN make install
+RUN sudo make install
 USER zx
 
 
