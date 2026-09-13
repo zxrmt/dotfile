@@ -214,11 +214,31 @@ config.window_frame = {
         inactive_titlebar_bg = "#1a1b26",
         active_titlebar_bg = "#1a1b26",
 }
-
-
 config.window_background_opacity = 0.95
 config.macos_window_background_blur = 50
 config.keys = {
+
+  -- ── Rename the current tab (interactive prompt) ────────────────────
+  -- Press COMMAND+SHIFT+E (⌘⇧E), type the new title, press Enter.
+  -- * Enter with an EMPTY input resets the tab to its default
+  --   (the running program's) title.
+  -- * ESC / CTRL-C cancels and changes nothing (line == nil).
+  -- NOTE: SUPER == CMD == WIN; on macOS SUPER is the Command (⌘) key.
+  {
+    key = 'E',
+    mods = 'SUPER|SHIFT',
+    action = act.PromptInputLine {
+      description = 'Enter new name for tab',
+      action = wezterm.action_callback(function(window, pane, line)
+        if line then
+          window:active_tab():set_title(line)
+        end
+      end),
+    },
+  },
+
+
+
 { key = 'a', mods = 'CMD', action = wezterm.action_callback(function(window, pane)
     local dims = pane:get_dimensions()
     local txt = pane:get_text_from_region(0, dims.scrollback_top, 0, dims.scrollback_top + dims.scrollback_rows)
@@ -229,7 +249,6 @@ config.keys = {
 { key = 'Backspace', mods = 'CTRL', action = act.SendKey { key = 'w', mods = 'CTRL' } },
 
 }
-
 
 
 function tab_title(tab_info)
