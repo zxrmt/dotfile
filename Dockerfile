@@ -50,6 +50,7 @@ RUN sudo apt-get update && \
 
 
 RUN sudo make install
+RUN rm -rf neovim
 USER zx
 
 
