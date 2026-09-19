@@ -1463,6 +1463,8 @@ def cmd_run_mini(opts, name: str, prompt: str, cwd: str, vlog) -> int:
     env = {k: v for k, v in os.environ.items()
            if k.startswith(("MSWEA_", "OPENAI_", "ANTHROPIC_"))
            or k in ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE")}
+    if getattr(opts, "token", None):
+        env["ANTHROPIC_API_KEY"] = opts.token
     _STATE["name"], _STATE["keep"] = name, opts.keep
     session_dir(name)
     write_meta(name, {"name": name, "cwd": cwd, "started_at": time.time(),
@@ -1592,6 +1594,8 @@ def cmd_run(opts) -> int:
     for k, v in os.environ.items():
         if (k.startswith("ANTHROPIC_") or k.startswith("CLAUDE_")) and k not in env:
             env[k] = v
+    if getattr(opts, "token", None):
+        env["ANTHROPIC_AUTH_TOKEN"] = opts.token
     claude_cmd = build_claude_cmd(name, opts)
 
     _STATE["name"], _STATE["keep"] = name, opts.keep
@@ -1855,7 +1859,9 @@ def parse_run_args(argv):
         description=(
             "Spawn and drive a sub-agent inside a tmux session.\n\n"
             "  --agent claude   drive the Claude Code TUI (default)\n"
-            "  --agent mini     drive the mini-swe-agent CLI to completion\n\n"
+            "  --agent mini     drive the mini-swe-agent CLI to completion\n"
+            "  --token KEY      feed an API key to the sub-agent (claude: ANTHROPIC_AUTH_TOKEN,\n"
+            "                   mini: ANTHROPIC_API_KEY); overrides a stale inherited key\n\n"
             "Inspect sub-agents (running or finished):\n"
             "  tmuxa list                 list sessions (state, elapsed, cwd, prompt)\n"
             "  tmuxa logs <name>          dump a session's full pane (cleaned)\n"
@@ -1869,6 +1875,10 @@ def parse_run_args(argv):
     p.add_argument("--name", help="session name (default: agent-<rand>); also the -n display name")
     p.add_argument("--cwd", help="working directory for the agent (default: $PWD)")
     p.add_argument("--model", help="pass through to claude --model")
+    p.add_argument("--token",
+                   help="API key for the sub-agent: exported as ANTHROPIC_AUTH_TOKEN (claude) or "
+                        "ANTHROPIC_API_KEY (mini) in the pane, overriding any stale key inherited "
+                        "from this shell (an inherited key would otherwise win over mini's .env)")
     p.add_argument("--session-id", dest="session_id",
                    help="force `claude --session-id <uuid>` (default: a generated UUID) so the "
                         "native transcript path is deterministic; reported in --json as "
