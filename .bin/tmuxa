@@ -46,6 +46,7 @@ DEFAULTS = dict(
     idle_secs=4.0,       # quiescence window for idle-completion (s)
     poll_ms=400,         # poll interval (ms) — each poll forks tmux clients per session;
                          # 400 keeps the shared-server fork rate sane under many parallel agents
+    busy_stale_secs=20.0, # transcript ends in end_turn + quiet this long while `claude agents` still says busy (background shell) => done; 0 disables
     agents_poll_ms=1500, # throttle for the `claude agents --json` status poll (ms) — that
                          # command forks a claude process and returns ALL agents globally, so it
                          # runs far less often than the frame poll to keep the fork rate sane
@@ -1332,6 +1333,22 @@ def stream_and_detect(name: str, marker: str | None, opts, vlog):
                     completion, detail = verdict, d
                     vlog(f"completion={verdict} (TUI fallback)")
                     break
+        elif av is None and getattr(opts, "busy_stale_secs", 0) > 0:
+            # STALE-BUSY OVERRIDE: `claude agents` reports busy for as long as the session has a
+            # background shell alive, even after the turn has settled (the agent answered, then
+            # `find /` or similar keeps running). The transcript is the ground truth for the turn:
+            # a last non-sidechain message that is an assistant end_turn, with the file quiet for
+            # busy_stale_secs, means the answer is final. Without this the job sits until the
+            # background command exits or the wall-clock timeout (observed: 13-47 min idle).
+            if tdet is None and det_path and os.path.exists(det_path):
+                tdet, transcript = TranscriptDetector(det_path), det_path
+            if tdet is not None and tdet.verdict() == "done":
+                quiet = time.time() - _transcript_mtime(transcript)
+                if quiet >= opts.busy_stale_secs:
+                    completion, detail = "done", None
+                    vlog(f"completion=done (transcript end_turn, quiet {quiet:.0f}s, "
+                         "claude agents still busy: background shell)")
+                    break
         # else: av is None (busy) or a suppressed question under --on-question wait →
         # authoritatively still working; skip the fallbacks and just pace the next poll.
 
@@ -1900,6 +1917,10 @@ def parse_run_args(argv):
                    help="quiescence window for idle-completion (s)")
     p.add_argument("--poll-ms", type=int, default=DEFAULTS["poll_ms"],
                    help="poll interval (ms)")
+    p.add_argument("--busy-stale-secs", type=float, default=DEFAULTS["busy_stale_secs"],
+                   help="treat the agent as done when its transcript ends in end_turn and has been "
+                        "quiet this long even though `claude agents` still reports busy (e.g. a "
+                        "background shell the agent left running); 0 disables")
     p.add_argument("--agents-poll-ms", type=int, default=DEFAULTS["agents_poll_ms"],
                    help="throttle for the `claude agents --json` status poll (ms); this is the "
                         "primary completion signal (same method as tmux-claude-session-manager)")
