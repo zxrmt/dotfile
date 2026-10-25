@@ -1,21 +1,52 @@
 FROM ubuntu:24.04
 
+# ---------------------------------------------------------------------------
+# Pinned versions. Everything fetched from the network is pinned to an exact
+# version or content hash so a rebuild can't silently pull new upstream code.
+#
+# Re-pin an installer script after reviewing the diff:
+#   curl -fsSL <url> | sha256sum
+# ---------------------------------------------------------------------------
+ARG NODESOURCE_SETUP_SHA256=2c4c6683a17b6f4128898a7b521e3c8bb725a99ffaf1b5e32ac97c6fa7d381be
+ARG FOUNDRY_INSTALL_SHA256=5a8990dff59498a094cb3562ed4be917b3000f32781b50c2b60b399b4ea37dd7
+ARG RUSTUP_INIT_SHA256=9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0
+
+ARG FOUNDRYUP_VERSION=2.0.0
+ARG RUST_VERSION=1.99.1
+ARG NEOVIM_VERSION=v0.12.6
+ARG CLAUDE_CODE_VERSION=2.1.310
+ARG CODEX_VERSION=0.164.0
+
+# Dotfile revision baked into the image. Bump this to the commit you want
+# after reviewing it; it also stops Docker caching a stale clone.
+ARG DOTFILE_SHA=ffbeda4527358c6919a8673e17319b3943a2b966
+
 RUN apt update -y && \
-    apt install -y curl gnupg && \
-    curl -sL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt install -y curl gnupg ca-certificates
+
+# NodeSource setup script verified by hash before it is run.
+RUN curl -fsSL -o /tmp/nodesource_setup.sh https://deb.nodesource.com/setup_20.x && \
+    echo "${NODESOURCE_SETUP_SHA256}  /tmp/nodesource_setup.sh" | sha256sum -c - && \
+    bash /tmp/nodesource_setup.sh && \
+    rm /tmp/nodesource_setup.sh && \
     apt install -y nodejs
 
 RUN apt update -y
 RUN apt install -y git gzip unzip make cmake ripgrep fzf tmux python3-venv bat build-essential curl wget xxd file fd-find jq
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 100
 
-RUN curl -L https://foundry.paradigm.xyz | bash
+# Foundry: the installer script is hash-verified and foundryup itself is version
+# pinned. The toolchain foundryup fetches still resolves at build time.
+RUN curl -fsSL -o /tmp/foundry_install.sh https://foundry.paradigm.xyz && \
+    echo "${FOUNDRY_INSTALL_SHA256}  /tmp/foundry_install.sh" | sha256sum -c - && \
+    FOUNDRYUP_VERSION="${FOUNDRYUP_VERSION}" bash /tmp/foundry_install.sh && \
+    rm /tmp/foundry_install.sh
 
 ENV PATH="/root/.foundry/bin:${PATH}"
 
 RUN foundryup
-RUN npm install -g @anthropic-ai/claude-code
-RUN npm install -g @openai/codex
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+RUN npm install -g @openai/codex@${CODEX_VERSION}
 
 
 
@@ -28,8 +59,11 @@ RUN apt update && apt install -y sudo \
 # this host kernel is 5.4 and docker seccomp returns EPERM for it
 # && update-alternatives --set sudo /usr/bin/sudo.ws
 
-# Rust lsp for vim
-RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+# Rust lsp for vim: rustup-init.sh hash-verified, toolchain version pinned.
+RUN curl -fsSL -o /tmp/rustup_init.sh https://sh.rustup.rs && \
+    echo "${RUSTUP_INIT_SHA256}  /tmp/rustup_init.sh" | sha256sum -c - && \
+    bash /tmp/rustup_init.sh -y --default-toolchain "${RUST_VERSION}" && \
+    rm /tmp/rustup_init.sh
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup component add rust-analyzer
 
@@ -37,7 +71,9 @@ USER zx
 # Python lsp for vim
 WORKDIR /home/zx/
 
-RUN git clone https://github.com/neovim/neovim --depth=1
+# Pinned release tag instead of master HEAD: release tarballs SHA256-check their
+# bundled dependencies, and the tree is reviewable.
+RUN git clone --depth=1 --branch "${NEOVIM_VERSION}" https://github.com/neovim/neovim
 WORKDIR neovim
 RUN make CMAKE_BUILD_TYPE=RelWithDebInfo
 
@@ -50,6 +86,7 @@ RUN sudo apt-get update && \
 
 
 RUN sudo make install
+WORKDIR /home/zx/
 RUN rm -rf neovim
 USER zx
 
@@ -57,9 +94,18 @@ USER zx
 
 WORKDIR /home/zx/
 
-RUN git clone https://github.com/zxrmt/dotfile
-RUN find dotfile -maxdepth 1 -mindepth 1 -not -name "." -not -name ".." -exec cp -r {} ./ \;
-RUN rm -rf .git
+RUN git clone https://github.com/zxrmt/dotfile \
+ && git -C dotfile checkout "${DOTFILE_SHA}" \
+ && find dotfile -maxdepth 1 -mindepth 1 -not -name ".git" -exec cp -r {} ./ \; \
+ && rm -rf dotfile
+
+# Install plugins at build time so a fresh container never fetches plugin code
+# on first launch. `restore` installs exactly the commits in lazy-lock.json.
+RUN nvim --headless "+Lazy! restore" +qa
+
+# Mason tools at pinned versions. Without this they auto-install from npm, PyPI
+# and GitHub releases on first startup, resolved against the live registry.
+RUN nvim --headless "+MasonInstall pyright@1.1.414 ruff@0.17.2 stylua@v2.6.0 shfmt@v3.14.1 codelldb@v1.12.3" +qa
 
 
 CMD ["/bin/bash"]
