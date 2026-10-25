@@ -19,7 +19,7 @@ ARG CODEX_VERSION=0.164.0
 
 # Dotfile revision baked into the image. Bump this to the commit you want
 # after reviewing it; it also stops Docker caching a stale clone.
-ARG DOTFILE_SHA=ffbeda4527358c6919a8673e17319b3943a2b966
+ARG DOTFILE_SHA=b5acd2980598dd90714e690dbaf733b90ccab6aa
 
 RUN apt update -y && \
     apt install -y curl gnupg ca-certificates
