@@ -8,18 +8,12 @@ FROM ubuntu:24.04
 #   curl -fsSL <url> | sha256sum
 # ---------------------------------------------------------------------------
 ARG NODESOURCE_SETUP_SHA256=2c4c6683a17b6f4128898a7b521e3c8bb725a99ffaf1b5e32ac97c6fa7d381be
-ARG FOUNDRY_INSTALL_SHA256=5a8990dff59498a094cb3562ed4be917b3000f32781b50c2b60b399b4ea37dd7
 ARG RUSTUP_INIT_SHA256=9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0
 
 ARG FOUNDRYUP_VERSION=2.0.0
 ARG RUST_VERSION=1.99.1
 ARG NEOVIM_VERSION=v0.12.0
-ARG CLAUDE_CODE_VERSION=2.1.310
-ARG CODEX_VERSION=0.164.0
 
-# Dotfile revision baked into the image. Bump this to the commit you want
-# after reviewing it; it also stops Docker caching a stale clone.
-ARG DOTFILE_SHA=b5acd2980598dd90714e690dbaf733b90ccab6aa
 
 RUN apt update -y && \
     apt install -y curl gnupg ca-certificates
@@ -45,8 +39,8 @@ RUN curl -fsSL -o /tmp/foundry_install.sh https://foundry.paradigm.xyz && \
 ENV PATH="/root/.foundry/bin:${PATH}"
 
 RUN foundryup
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
-RUN npm install -g @openai/codex@${CODEX_VERSION}
+RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @openai/codex
 
 
 
@@ -95,7 +89,6 @@ USER zx
 WORKDIR /home/zx/
 
 RUN git clone https://github.com/zxrmt/dotfile \
- && git -C dotfile checkout "${DOTFILE_SHA}" \
  && find dotfile -maxdepth 1 -mindepth 1 -not -name ".git" -exec cp -r {} ./ \; \
  && rm -rf dotfile
 
