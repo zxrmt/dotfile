@@ -23,7 +23,7 @@ ARG NEOVIM_VERSION=v0.12.0
 # zx cannot read).
 # ---------------------------------------------------------------------------
 RUN apt-get update -y && \
-    apt-get install -y net-tools tree curl gnupg ca-certificates xz-utils \
+    apt-get install -y net-tools tree curl gnupg ca-certificates xz-utils python3-pip \
         git gzip unzip make cmake ripgrep fzf tmux python3-venv bat \
         build-essential wget xxd file fd-find jq sudo && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3 100 && \
