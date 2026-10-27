@@ -2,6 +2,7 @@ vim.g.mapleader = " "
 vim.g.maplocalleader = "\\"
 
 vim.opt.laststatus = 3
+vim.opt.cmdheight = 0
 vim.wo.wrap = true
 vim.wo.linebreak = true
 vim.wo.list = false
