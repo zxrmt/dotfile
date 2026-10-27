@@ -29,17 +29,10 @@ RUN apt update -y
 RUN apt install -y git gzip unzip make cmake ripgrep fzf tmux python3-venv bat build-essential curl wget xxd file fd-find jq
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 100
 
-# Foundry: the installer script is hash-verified and foundryup itself is version
-# pinned. The toolchain foundryup fetches still resolves at build time.
-RUN curl -fsSL -o /tmp/foundry_install.sh https://foundry.paradigm.xyz && \
-    echo "${FOUNDRY_INSTALL_SHA256}  /tmp/foundry_install.sh" | sha256sum -c - && \
-    FOUNDRYUP_VERSION="${FOUNDRYUP_VERSION}" bash /tmp/foundry_install.sh && \
-    rm /tmp/foundry_install.sh
 
-ENV PATH="/root/.foundry/bin:${PATH}"
 
-RUN foundryup
-RUN npm install -g @anthropic-ai/claude-code
+
+RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN npm install -g @openai/codex
 
 
