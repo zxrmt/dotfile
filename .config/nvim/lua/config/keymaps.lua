@@ -1,13 +1,8 @@
--- Keymaps are automatically loaded on the VeryLazy event
--- Default keymaps that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/keymaps.lua
--- Add any additional keymaps here
---
 vim.api.nvim_set_keymap("n", "q", "<Nop>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("v", "q", "<Nop>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "m", ":w<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", "<C-m>", ":w<CR>", { noremap = true, silent = true })
 vim.api.nvim_set_keymap("n", ";", ":", { noremap = true, silent = true })
-vim.api.nvim_set_keymap("n", "f", ":Telescope grep_string", { noremap = true, silent = true })
 
 -- Delete current buffer but let other open, jump back to prev buffer
 vim.api.nvim_set_keymap("n", "q", ":bp | bd #<CR>", { noremap = true, silent = true })

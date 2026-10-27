@@ -13,7 +13,7 @@ ARG RUSTUP_INIT_SHA256=9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e08
 
 ARG FOUNDRYUP_VERSION=2.0.0
 ARG RUST_VERSION=1.99.1
-ARG NEOVIM_VERSION=v0.12.6
+ARG NEOVIM_VERSION=v0.12.0
 ARG CLAUDE_CODE_VERSION=2.1.310
 ARG CODEX_VERSION=0.164.0
 
@@ -98,14 +98,5 @@ RUN git clone https://github.com/zxrmt/dotfile \
  && git -C dotfile checkout "${DOTFILE_SHA}" \
  && find dotfile -maxdepth 1 -mindepth 1 -not -name ".git" -exec cp -r {} ./ \; \
  && rm -rf dotfile
-
-# Install plugins at build time so a fresh container never fetches plugin code
-# on first launch. `restore` installs exactly the commits in lazy-lock.json.
-RUN nvim --headless "+Lazy! restore" +qa
-
-# Mason tools at pinned versions. Without this they auto-install from npm, PyPI
-# and GitHub releases on first startup, resolved against the live registry.
-RUN nvim --headless "+MasonInstall pyright@1.1.414 ruff@0.17.2 stylua@v2.6.0 shfmt@v3.14.1 codelldb@v1.12.3" +qa
-
 
 CMD ["/bin/bash"]

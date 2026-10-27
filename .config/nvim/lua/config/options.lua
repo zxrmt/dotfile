@@ -1,10 +1,14 @@
--- Options are automatically loaded before lazy.nvim startup
--- Default options that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/options.lua
--- Add any additional options here
+vim.g.mapleader = " "
+vim.g.maplocalleader = "\\"
+
 vim.opt.laststatus = 3
-vim.g.snacks_animate = false
 vim.wo.wrap = true
 vim.wo.linebreak = true
-vim.wo.list = false -- extra option I set in addition to the ones in your question
-vim.diagnostic.disable = true
-vim.g.autoformat = false
+vim.wo.list = false
+
+-- built-in stand-ins for the file/grep pickers (<leader>ff, <leader>/ ...)
+vim.opt.path:append("**")
+if vim.fn.executable("rg") == 1 then
+  vim.opt.grepprg = "rg --vimgrep --smart-case"
+  vim.opt.grepformat = "%f:%l:%c:%m"
+end
