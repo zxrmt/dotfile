@@ -17,3 +17,21 @@ end
 -- tokyonight-moon, transparent (colors/tokyonight-moon.lua). No background is
 -- painted, so tmux's window-style shows through on unfocused panes.
 vim.cmd.colorscheme("tokyonight-moon")
+
+-- Clipboard (restored from LazyVim: `clipboard = unnamedplus`).
+-- Yanks go to the system clipboard through OSC 52, which passes through tmux
+-- (`set-clipboard on`) to the outer terminal, so they paste outside tmux too.
+-- Paste reads from the local register: querying the terminal via OSC 52 hangs
+-- inside tmux.
+vim.opt.clipboard = "unnamedplus"
+do
+  local osc52 = require("vim.ui.clipboard.osc52")
+  local function paste()
+    return { vim.fn.split(vim.fn.getreg(""), "\n"), vim.fn.getregtype("") }
+  end
+  vim.g.clipboard = {
+    name = "OSC 52",
+    copy = { ["+"] = osc52.copy("+"), ["*"] = osc52.copy("*") },
+    paste = { ["+"] = paste, ["*"] = paste },
+  }
+end
