@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Claude Code status line: model · reasoning effort · context · 5h limit · weekly limit
+# Prefixed with the current working directory
 # Reads the status JSON from stdin (see https://code.claude.com/docs/en/statusline.md)
 
 input=$(cat)
@@ -7,6 +8,7 @@ input=$(cat)
 # --- Extract fields with jq (fall back gracefully when absent) ---
 model=$(printf '%s' "$input" | jq -r '.model.display_name // "?"')
 effort=$(printf '%s' "$input" | jq -r '.effort.level // empty')
+cwd=$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty')
 
 used_pct=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty')
 used_tok=$(printf '%s' "$input" | jq -r '.context_window.total_input_tokens // empty')
@@ -40,7 +42,7 @@ fi
 
 # --- ANSI colors ---
 DIM=$'\033[2m'; RESET=$'\033[0m'
-CYAN=$'\033[36m'; YELLOW=$'\033[33m'; GREEN=$'\033[32m'; RED=$'\033[31m'
+CYAN=$'\033[36m'; BLUE=$'\033[34m'; YELLOW=$'\033[33m'; GREEN=$'\033[32m'; RED=$'\033[31m'
 
 # Pick a color for a 0-100 percentage (green < 60 <= yellow < 80 <= red)
 pct_color() {
@@ -78,6 +80,7 @@ fi
 
 # --- Assemble ---
 out="${CYAN}${model}${RESET}"
+[ -n "$cwd" ] && out="${BLUE}${cwd}${RESET} ${DIM}·${RESET} ${out}"
 [ -n "$effort" ] && out="${out} ${DIM}·${RESET} ${YELLOW}${effort}${RESET}"
 out="${out} ${DIM}·${RESET} ${ctx_color}${ctx}${RESET}"
 
