@@ -37,12 +37,15 @@ tmux() {
 
 export FZF_DEFAULT_OPTS='--bind ctrl-i:half-page-down,ctrl-e:half-page-up,ctrl-u:preview-half-page-up,ctrl-d:preview-half-page-down' 
 
+
+export FZF_DEFAULT_OPTS='--bind ctrl-i:half-page-down,ctrl-e:half-page-up,ctrl-u:preview-half-page-up,ctrl-d:preview-half-page-down' 
+
 f() {
   fzf --preview 'batcat --style=numbers --color=always {}' 
 }
 
 # Using g to see current change, g <commit_id> to see the commit change
-g() {
+c() {
   if [ $# -eq 0 ]; then
     # Unstaged changes
     git diff --name-only |
@@ -60,12 +63,32 @@ g() {
   fi
 }
 
+gf() {
+  rg --line-number --no-heading --color=always --smart-case "${1:-}" | \
+  fzf --ansi \
+      --color "hl:-1:underline,hl+:-1:underline:bold" \
+      --delimiter : \
+      --preview 'batcat --color=always --highlight-line {2} {1}' \
+      --preview-window 'up,60%,border-bottom,+{2}+3/3' \
+      --bind 'enter:become(nvim {1} +{2})'
+}
+
+
+
 # Using this to sync the ZAI_API_KEY between tmux panel
 
 # __tmux_sync_myvar() {
 #  [[ -n "$TMUX" ]] && tmux set -p -t "$TMUX_PANE" @ZAI_API_KEY "$ZAI_API_KEY" 2>/dev/null
 # }
 # PROMPT_COMMAND="__tmux_sync_myvar${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# Alway full permission
+alias yolo="claude --dangerously-skip-permissions"
+alias codex="codex --yolo"
+
+alias vf='vim "$(fzf)"'
+alias bat="batcat"
+
 
 # Alway full permission
 alias yolo="claude --dangerously-skip-permissions"
