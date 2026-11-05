@@ -4,6 +4,17 @@ bindkey "^[[1;3D" backward-word
 export PROMPT='%{$fg[green]%}${${:-$(printf "/%.1s" ${(s./.)PWD:h})/${PWD:t}}/\/\///}%{$reset_color%} # '
 
 
+# Enable history substring/prefix search on arrow keys
+autoload -U up-line-or-beginning-search
+autoload -U down-line-or-beginning-search
+zle -N up-line-or-beginning-search
+zle -N down-line-or-beginning-search
+
+# Bind arrow keys using terminfo for compatibility, with escape sequence fallbacks
+[[ -n "${terminfo[kcuu1]}" ]] && bindkey "${terminfo[kcuu1]}" up-line-or-beginning-search
+[[ -n "${terminfo[kcud1]}" ]] && bindkey "${terminfo[kcud1]}" down-line-or-beginning-search
+
+
 ssh() {
   local target=""
   # Find the first argument that isn't an option flag (like -p or -i)
