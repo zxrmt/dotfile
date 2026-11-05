@@ -62,7 +62,7 @@ c() {
     return 2
   fi
 }
-
+# gf "def " -e "py" -i "tests" -i ".git"
 gf() {
   local pattern=""
   local -a rg_args=()
