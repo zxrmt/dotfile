@@ -64,7 +64,41 @@ c() {
 }
 
 gf() {
-  rg --line-number --no-heading --color=always --smart-case "${1:-}" | \
+  local pattern=""
+  local -a rg_args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i)
+        [[ $# -lt 2 ]] && { echo "Missing directory after -i"; return 1; }
+        rg_args+=(--glob "!**/$2/**")
+        shift 2
+        ;;
+      -e)
+        [[ $# -lt 2 ]] && { echo "Missing extension after -e"; return 1; }
+        rg_args+=(--glob "*.${2#.}")
+        shift 2
+        ;;
+      *)
+        pattern="$1"
+        shift
+        ;;
+    esac
+  done
+
+  # No search pattern: browse files
+  if [[ -z "$pattern" ]]; then
+    rg --files "${rg_args[@]}" | \
+    fzf --ansi \
+        --preview 'batcat --color=always -- {}' \
+        --preview-window 'up,60%,border-bottom' \
+        --bind 'enter:become(nvim -- {})'
+    return
+  fi
+
+  # Search file contents
+  rg --line-number --no-heading --color=always --smart-case \
+      "${rg_args[@]}" -- "$pattern" | \
   fzf --ansi \
       --color "hl:-1:underline,hl+:-1:underline:bold" \
       --delimiter : \
@@ -72,6 +106,7 @@ gf() {
       --preview-window 'up,60%,border-bottom,+{2}+3/3' \
       --bind 'enter:become(nvim {1} +{2})'
 }
+
 
 
 
