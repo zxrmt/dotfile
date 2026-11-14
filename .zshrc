@@ -51,3 +51,22 @@ fsh() {
     ssh "$host"
   fi
 }
+
+
+container() {
+  local sub=$1
+  [[ $sub == (machine|m) ]] && sub=$2
+  if [[ ! -t 0 || ! -t 1 || $sub != (exec|run) ]]; then
+    command container "$@"
+    return
+  fi
+  local s rc
+  s=$(stty -g) || return
+  stty -onlcr
+  command container "$@"
+  rc=$?
+  stty "$s"
+  return $rc
+}
+
+alias c="container"
