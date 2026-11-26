@@ -262,6 +262,28 @@ function tab_title(tab_info)
   return tab_info.active_pane.title
 end
 
+-- Using CMD SHIFT T to translate text
+config.keys = config.keys or {}
+table.insert(config.keys, {
+    key = 't',
+    mods = 'CMD|SHIFT',
+    action = wezterm.action_callback(function(window, pane)
+        local text = window:get_selection_text_for_pane(pane)
+
+        if text == '' then
+            return
+        end
+
+        wezterm.background_child_process({
+            '/bin/sh',
+            '-c',
+            'printf "%s" "$1" | /usr/bin/shortcuts run "Translate Clipboard" -i -',
+            'translate',
+            text,
+        })
+    end),
+})
+
 
 -- and finally, return the configuration to wezterm
 return config
