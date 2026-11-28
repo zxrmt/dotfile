@@ -1632,6 +1632,149 @@ def cmd_run_opencode(opts, name: str, prompt: str, cwd: str, vlog) -> int:
             _STATE["name"] = None
 
 
+# ── opencode INTERACTIVE backend (`--agent opencode`): the opencode TUI is spawned in the
+# tmux pane (`opencode --auto`) and the prompt is PASTED into its input box, exactly like the
+# claude backend. Completion/answer come from opencode's own session store
+# (`opencode session list/export`): the session is "done" once its message log ends with an
+# `idle` entry after the last user message. Screen signals are only used for readiness.
+
+def _oc_json(oc: str, cwd: str, *args: str, timeout: float = 20.0):
+    try:
+        r = subprocess.run([oc, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _oc_session_ids(oc: str, cwd: str) -> dict:
+    rows = _oc_json(oc, cwd, "session", "list", "--format", "json") or []
+    return {r["id"]: r for r in rows if isinstance(r, dict) and "id" in r}
+
+
+def _oc_state(oc: str, cwd: str, sid: str):
+    """(done, answer, error) from `opencode session export`."""
+    d = _oc_json(oc, cwd, "session", "export", sid)
+    msgs = (d or {}).get("messages") or []
+    last_user = max((i for i, m in enumerate(msgs) if m.get("type") == "user"), default=-1)
+    if last_user < 0:
+        return False, None, None
+    tail = msgs[last_user + 1:]
+    done = bool(tail) and tail[-1].get("type") == "idle"
+    err = None
+    if done and tail[-1].get("outcome") not in (None, "succeeded"):
+        err = f"outcome={tail[-1].get('outcome')}"
+    texts = []
+    for m in tail:
+        if m.get("type") == "assistant":
+            texts.append("".join(c.get("text", "") for c in m.get("content") or []
+                                 if isinstance(c, dict) and c.get("type") == "text").strip())
+    texts = [t for t in texts if t]
+    return done, (texts[-1] if texts else ""), err
+
+
+def _oc_frame_ready(frame: str) -> bool:
+    return "ctrl+p commands" in frame and "esc interrupt" not in frame
+
+
+def cmd_run_opencode_tui(opts, name: str, prompt: str, cwd: str, vlog) -> int:
+    obin = opencode_bin()
+    if not ((os.path.isabs(obin) and os.path.exists(obin)) or shutil.which(obin)):
+        print("tmuxa: opencode not found on PATH; install opencode or use --agent claude",
+              file=sys.stderr)
+        return 6
+    if opts.model:
+        warn("--model is ignored by the opencode TUI backend (pick the model in opencode)")
+    session_dir(name)
+    cmd = f"exec {shlex.quote(obin)} --auto"
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith(("OPENCODE_", "OPENAI_", "ANTHROPIC_", "GOOGLE_", "GEMINI_",
+                            "OPENROUTER_", "AWS_", "AZURE_", "XDG_"))
+           or k in ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE")}
+    if getattr(opts, "token", None):
+        env["ANTHROPIC_API_KEY"] = opts.token
+    _STATE["name"], _STATE["keep"] = name, opts.keep
+    write_meta(name, {"name": name, "cwd": cwd, "started_at": time.time(),
+                      "prompt": prompt[:200], "completion": opts.completion,
+                      "agent": "opencode", "account": None, "socket": SOCKET,
+                      "pid": os.getpid()})
+    log = str(SESSIONS_DIR / name / "raw.log")
+    poll = opts.poll_ms / 1000.0
+    before = set(_oc_session_ids(obin, cwd))
+    try:
+        new_agent_session(name, cwd, cmd, env)
+    except TmuxError as e:
+        print(f"tmuxa: failed to spawn session: {e}", file=sys.stderr)
+        return 6
+    try:
+        attach_pipe(name, log)
+        vlog(f"spawned opencode TUI '{name}' (cwd={cwd})")
+        # 1. wait for the input box
+        deadline, hits = time.time() + opts.ready_timeout, 0
+        while True:
+            if time.time() > deadline:
+                print("tmuxa: opencode TUI did not become ready in time", file=sys.stderr)
+                sys.stderr.write(capture(name) + "\n")
+                return 4
+            dead, code, _ = pane_status(name)
+            if dead:
+                print(f"tmuxa: opencode exited during startup (code={code})", file=sys.stderr)
+                sys.stderr.write(capture(name, history=True) + "\n")
+                return 5
+            hits = hits + 1 if _oc_frame_ready(capture(name)) else 0
+            if hits >= 2:
+                break
+            time.sleep(poll)
+        # 2. paste the prompt, submit
+        load_and_paste(name, prompt)
+        needle = (prompt.strip().splitlines() or [""])[-1][:30]
+        t = time.time()
+        while time.time() - t < 8 and needle and needle not in capture(name):
+            time.sleep(0.1)
+        time.sleep(0.3)
+        send_key(name, "Enter")
+        vlog("prompt submitted")
+        # 3. watch the session store until it ends in `idle`
+        deadline = time.time() + opts.timeout
+        sid, completion, detail, answer, resent = None, "timeout", None, "", False
+        t_sub = time.time()
+        while time.time() < deadline:
+            dead, code, _ = pane_status(name)
+            if dead:
+                completion, detail = "crash", f"opencode exited code={code}"
+                break
+            if sid is None:
+                new = [r for i, r in _oc_session_ids(obin, cwd).items() if i not in before]
+                if new:
+                    sid = max(new, key=lambda r: r.get("created", 0))["id"]
+                    vlog(f"opencode session {sid}")
+                elif not resent and time.time() - t_sub > 6:
+                    vlog("no session after submit; re-sending Enter")
+                    send_key(name, "Enter")
+                    resent = True
+            if sid:
+                done, ans, err = _oc_state(obin, cwd, sid)
+                if done:
+                    completion, detail, answer = ("crash", err, ans) if err else ("done", None, ans)
+                    vlog("completion=done (opencode session idle)")
+                    break
+            time.sleep(max(poll, 1.0))
+        full = capture(name, history=True)
+        try:
+            (SESSIONS_DIR / name / "transcript.txt").write_text("\n".join(clean_capture(full)))
+        except OSError:
+            pass
+        if not answer:
+            answer = collapse_blanks("\n".join(clean_capture(full))).strip()
+        emit_result(name, completion, detail, answer, opts)
+        return exit_code_for(completion)
+    finally:
+        if opts.keep:
+            print(f"[tmuxa] session kept: tmux -S {SOCKET} attach -t {name}", file=sys.stderr)
+        else:
+            kill_session(name)
+            _STATE["name"] = None
+
+
 def exit_code_for(completion: str) -> int:
     return {"sentinel": 0, "idle": 0, "done": 0, "question": 0,
             "timeout": 3, "crash": 5}.get(completion, 0)
@@ -1702,8 +1845,10 @@ def cmd_run(opts) -> int:
     cwd = os.path.abspath(os.path.expanduser(opts.cwd)) if opts.cwd else os.getcwd()
     if getattr(opts, "agent", "claude") == "mini":
         return cmd_run_mini(opts, name, prompt, cwd, vlog)
-    if getattr(opts, "agent", "claude") == "opencode":
+    if getattr(opts, "agent", "claude") == "opencode-run":
         return cmd_run_opencode(opts, name, prompt, cwd, vlog)
+    if getattr(opts, "agent", "claude") == "opencode":
+        return cmd_run_opencode_tui(opts, name, prompt, cwd, vlog)
     # Force a known Claude Code session id (generated if not supplied) so its native
     # JSONL transcript lands at a DETERMINISTIC path the caller can read directly —
     # see claude_transcript_path(). build_claude_cmd passes it as `claude --session-id`.
@@ -1806,7 +1951,7 @@ def cmd_list(argv) -> int:
     for n in sorted(list_session_names()):
         meta = read_meta(n)
         if session_exists(n):
-            if meta.get("agent") in ("mini", "opencode"):
+            if meta.get("agent") in ("mini", "opencode-run"):
                 dead, _, _ = pane_status(n)
                 state = "working" if not dead else "dead"
             else:
@@ -2003,7 +2148,8 @@ def parse_run_args(argv):
             "Spawn and drive a sub-agent inside a tmux session.\n\n"
             "  --agent claude   drive the Claude Code TUI (default)\n"
             "  --agent mini     drive the mini-swe-agent CLI to completion\n"
-            "  --agent opencode drive `opencode run` to completion (-m provider/model)\n"
+            "  --agent opencode drive the opencode TUI (`opencode --auto`, prompt pasted)\n"
+            "  --agent opencode-run  headless `opencode run` to completion (-m provider/model)\n"
             "  --token KEY      feed an API key to the sub-agent (claude: ANTHROPIC_AUTH_TOKEN,\n"
             "                   mini: ANTHROPIC_API_KEY); overrides a stale inherited key\n\n"
             "Inspect sub-agents (running or finished):\n"
@@ -2055,7 +2201,7 @@ def parse_run_args(argv):
                    help="disable the claude-agents status signal; use only transcript/TUI detection")
     p.add_argument("--completion", choices=["hybrid", "idle", "sentinel"], default="hybrid",
                    help="done-detection strategy (default hybrid: sentinel + idle)")
-    p.add_argument("--agent", choices=["claude", "mini", "opencode"], default="claude",
+    p.add_argument("--agent", choices=["claude", "mini", "opencode", "opencode-run"], default="claude",
                    help="which sub-agent to spawn: 'claude' (Claude Code TUI) or "
                         "'mini' (mini-swe-agent CLI, driven headlessly to completion), or "
                         "'opencode' (opencode run --auto; -m provider/model)")
