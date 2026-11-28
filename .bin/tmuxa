@@ -1420,7 +1420,8 @@ def _read_mini_trajectory(path: str) -> tuple[str | None, str | None]:
             str(info["exit_status"]) if info.get("exit_status") is not None else None)
 
 
-def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog):
+def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog,
+                           label: str = "mini", reader=None):
     """Tail the pane until the mini process exits, then read its final answer.
 
     Unlike the claude backend there is no TUI to screen-scrape: the task was handed to
@@ -1441,7 +1442,7 @@ def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog):
             sys.stdout.flush()
         dead, code, _ = pane_status(name)
         if dead:
-            vlog(f"completion=exit (mini process exited code={code})")
+            vlog(f"completion=exit ({label} process exited code={code})")
             completion, detail = "done", code
             break
         time.sleep(poll)
@@ -1454,9 +1455,15 @@ def stream_and_detect_mini(name: str, opts, log: str, trajectory: str, vlog):
         (SESSIONS_DIR / name / "transcript.txt").write_text("\n".join(clean_capture(full)))
     except OSError:
         pass
-    submission, exit_status = _read_mini_trajectory(trajectory)
-    if completion == "done" and exit_status and exit_status.lower() != "submitted":
-        completion, detail = "crash", exit_status   # exited, but did NOT submit
+    if reader is not None:                   # opencode: exit code + error event decide crash
+        submission, err = reader(trajectory)
+        if completion == "done" and (err or (detail not in (0, "0", None))):
+            completion, detail = "crash", err or detail
+        exit_status = None
+    else:
+        submission, exit_status = _read_mini_trajectory(trajectory)
+        if completion == "done" and exit_status and exit_status.lower() != "submitted":
+            completion, detail = "crash", exit_status   # exited, but did NOT submit
     if opts.full_transcript and completion != "crash":
         body = [l for l in clean_capture(full) if not is_status_line(l)]
         return completion, detail, collapse_blanks("\n".join(body)).strip()
@@ -1498,6 +1505,123 @@ def cmd_run_mini(opts, name: str, prompt: str, cwd: str, vlog) -> int:
         attach_pipe(name, log)
         vlog(f"spawned mini agent '{name}' (cwd={cwd}, trajectory={traj})")
         completion, detail, answer = stream_and_detect_mini(name, opts, log, traj, vlog)
+        emit_result(name, completion, detail, answer, opts)
+        return exit_code_for(completion)
+    finally:
+        if opts.keep:
+            print(f"[tmuxa] session kept: tmux -S {SOCKET} attach -t {name}", file=sys.stderr)
+        else:
+            kill_session(name)
+            _STATE["name"] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# opencode backend (`--agent opencode`)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def opencode_bin() -> str:
+    """Absolute path to the opencode CLI (robust against the tmux server's PATH)."""
+    return (shutil.which("opencode")
+            or next((c for c in (os.path.expanduser("~/.opencode/bin/opencode"),)
+                     if os.path.exists(c)), "opencode"))
+
+
+# Inline pane-side filter: reads opencode's `--format json` event stream on stdin and
+# prints human-readable lines (assistant text + tool calls) so the pane stays attachable.
+_OC_RENDER = (
+    "import sys,json\n"
+    "for l in sys.stdin:\n"
+    "    try: o=json.loads(l)\n"
+    "    except ValueError:\n"
+    "        print(l,end='');continue\n"
+    "    p=o.get('part') or {};t=o.get('type')\n"
+    "    if t=='text': print(p.get('text',''),flush=True)\n"
+    "    elif t=='tool_use':\n"
+    "        st=p.get('state') or {};print('[tool] %s %s'%(p.get('tool',''),json.dumps(st.get('input',''))[:200]),flush=True)\n"
+    "    elif t=='error': print('[error] '+json.dumps(o.get('error',o)),flush=True)\n"
+)
+
+
+def build_opencode_cmd(oc_path: str, opts, prompt: str, events: str) -> str:
+    """Shell line running ONE opencode task to completion; process exit == completion.
+
+    `--auto` approves permissions; `--format json` events are tee'd to `events` (the
+    authoritative source of the final answer) and rendered readably into the pane."""
+    parts = [shlex.quote(oc_path), "run", "--auto", "--format", "json"]
+    if opts.model:
+        parts += ["-m", shlex.quote(opts.model)]
+    parts.append(shlex.quote(prompt))
+    pipeline = (" ".join(parts) + f" 2>&1 | tee {shlex.quote(events)}"
+                f" | python3 -c {shlex.quote(_OC_RENDER)}")
+    return "exec bash -c " + shlex.quote("set -o pipefail; " + pipeline)
+
+
+def _read_opencode_events(path: str) -> tuple[str | None, str | None]:
+    """(answer, error) from an opencode JSON event stream: the text parts of the final
+    assistant message (last messageID that produced text), or an error event's message."""
+    msgs: dict[str, list[str]] = {}
+    order: list[str] = []
+    error = None
+    try:
+        lines = pathlib.Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return None, None
+    for l in lines:
+        try:
+            o = json.loads(l)
+        except ValueError:
+            continue
+        if not isinstance(o, dict):
+            continue
+        if o.get("type") == "error":
+            e = o.get("error")
+            error = json.dumps(e) if not isinstance(e, str) else e
+        elif o.get("type") == "text":
+            part = o.get("part") or {}
+            mid = part.get("messageID") or ""
+            if mid not in msgs:
+                msgs[mid] = []
+                order.append(mid)
+            msgs[mid].append(part.get("text") or "")
+    answer = "\n".join(msgs[order[-1]]).strip() if order else None
+    return answer, error
+
+
+def cmd_run_opencode(opts, name: str, prompt: str, cwd: str, vlog) -> int:
+    """Drive one opencode task inside a tmux session (the `--agent opencode` backend)."""
+    obin = opencode_bin()
+    if not ((os.path.isabs(obin) and os.path.exists(obin)) or shutil.which(obin)):
+        print("tmuxa: opencode not found on PATH; install opencode or use --agent claude",
+              file=sys.stderr)
+        return 6
+    session_dir(name)
+    events = str(SESSIONS_DIR / name / "opencode_events.jsonl")
+    cmd = build_opencode_cmd(obin, opts, prompt, events)
+    # Forward provider creds/config + HOME so the pane doesn't depend on the shared tmux
+    # server's env (opencode keeps auth in ~/.local/share/opencode, found via HOME).
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith(("OPENCODE_", "OPENAI_", "ANTHROPIC_", "GOOGLE_", "GEMINI_",
+                            "OPENROUTER_", "AWS_", "AZURE_", "XDG_"))
+           or k in ("HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE")}
+    if getattr(opts, "token", None):
+        env["ANTHROPIC_API_KEY"] = opts.token
+    _STATE["name"], _STATE["keep"] = name, opts.keep
+    write_meta(name, {"name": name, "cwd": cwd, "started_at": time.time(),
+                      "prompt": prompt[:200], "completion": opts.completion,
+                      "agent": "opencode", "opencode_events": events,
+                      "account": None, "socket": SOCKET, "pid": os.getpid()})
+    log = str(SESSIONS_DIR / name / "raw.log")
+    try:
+        new_agent_session(name, cwd, cmd, env)
+    except TmuxError as e:
+        print(f"tmuxa: failed to spawn session: {e}", file=sys.stderr)
+        return 6
+    try:
+        attach_pipe(name, log)
+        vlog(f"spawned opencode agent '{name}' (cwd={cwd}, events={events})")
+        completion, detail, answer = stream_and_detect_mini(
+            name, opts, log, events, vlog, label="opencode",
+            reader=_read_opencode_events)
         emit_result(name, completion, detail, answer, opts)
         return exit_code_for(completion)
     finally:
@@ -1578,6 +1702,8 @@ def cmd_run(opts) -> int:
     cwd = os.path.abspath(os.path.expanduser(opts.cwd)) if opts.cwd else os.getcwd()
     if getattr(opts, "agent", "claude") == "mini":
         return cmd_run_mini(opts, name, prompt, cwd, vlog)
+    if getattr(opts, "agent", "claude") == "opencode":
+        return cmd_run_opencode(opts, name, prompt, cwd, vlog)
     # Force a known Claude Code session id (generated if not supplied) so its native
     # JSONL transcript lands at a DETERMINISTIC path the caller can read directly —
     # see claude_transcript_path(). build_claude_cmd passes it as `claude --session-id`.
@@ -1680,7 +1806,7 @@ def cmd_list(argv) -> int:
     for n in sorted(list_session_names()):
         meta = read_meta(n)
         if session_exists(n):
-            if meta.get("agent") == "mini":
+            if meta.get("agent") in ("mini", "opencode"):
                 dead, _, _ = pane_status(n)
                 state = "working" if not dead else "dead"
             else:
@@ -1877,6 +2003,7 @@ def parse_run_args(argv):
             "Spawn and drive a sub-agent inside a tmux session.\n\n"
             "  --agent claude   drive the Claude Code TUI (default)\n"
             "  --agent mini     drive the mini-swe-agent CLI to completion\n"
+            "  --agent opencode drive `opencode run` to completion (-m provider/model)\n"
             "  --token KEY      feed an API key to the sub-agent (claude: ANTHROPIC_AUTH_TOKEN,\n"
             "                   mini: ANTHROPIC_API_KEY); overrides a stale inherited key\n\n"
             "Inspect sub-agents (running or finished):\n"
@@ -1928,9 +2055,10 @@ def parse_run_args(argv):
                    help="disable the claude-agents status signal; use only transcript/TUI detection")
     p.add_argument("--completion", choices=["hybrid", "idle", "sentinel"], default="hybrid",
                    help="done-detection strategy (default hybrid: sentinel + idle)")
-    p.add_argument("--agent", choices=["claude", "mini"], default="claude",
+    p.add_argument("--agent", choices=["claude", "mini", "opencode"], default="claude",
                    help="which sub-agent to spawn: 'claude' (Claude Code TUI) or "
-                        "'mini' (mini-swe-agent CLI, driven headlessly to completion)")
+                        "'mini' (mini-swe-agent CLI, driven headlessly to completion), or "
+                        "'opencode' (opencode run --auto; -m provider/model)")
     p.add_argument("--on-question", choices=["return", "wait"], default="return",
                    help="what to do if the agent stops to ask a question")
     p.add_argument("--keep", action="store_true", help="don't kill the session at the end")
